@@ -232,7 +232,7 @@ class RSRTTSDemo:
             # --- End New Logic ---
 
             # Build initial log
-            log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
+            log = f"🎙️ Generating Audio with {num_speakers} speakers\n"
             log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
             log += f"🎭 Speakers: {', '.join(selected_speaker_names_for_log)}\n"
             
@@ -978,7 +978,7 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
         with gr.Row():
             # Left column - Settings
             with gr.Column(scale=1, elem_classes="settings-card"):
-                gr.Markdown("### 🎛️ **Podcast Settings**")
+                gr.Markdown("### 🎛️ **Audio Settings**")
                 
                 # Number of speakers
                 num_speakers = gr.Slider(
@@ -1037,9 +1037,9 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
                 
                 script_input = gr.Textbox(
                     label="Conversation Script",
-                    placeholder="""Enter your podcast script here. You can format it as:
+                    placeholder="""Enter your Audio script here. You can format it as:
 
-Speaker 1: Welcome to our podcast today!
+Speaker 1: Welcome to our Show today!
 Speaker 2: Thanks for having me. I'm excited to discuss...
 
 Or paste text directly and it will auto-assign speakers.""",
@@ -1061,7 +1061,7 @@ Or paste text directly and it will auto-assign speakers.""",
                     
                     # Generate button (now on the right)
                     generate_btn = gr.Button(
-                        "🚀 Generate Podcast",
+                        "🚀 Generate Audio",
                         size="lg",
                         variant="primary",
                         elem_classes="generate-btn",
@@ -1097,7 +1097,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 )
                 
                 # Output section
-                gr.Markdown("### 🎵 **Generated Podcast**")
+                gr.Markdown("### 🎵 **Generated Audio**")
                 
                 # Streaming audio output (outside of tabs for simpler handling)
                 audio_output = gr.Audio(
@@ -1112,7 +1112,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 
                 # Complete audio output (non-streaming)
                 complete_audio_output = gr.Audio(
-                    label="Complete Podcast (Download after generation)",
+                    label="Complete Audio (Download after generation)",
                     type="numpy",
                     elem_classes="audio-output complete-audio-section",
                     streaming=False,  # Non-streaming mode
@@ -1252,7 +1252,7 @@ Or paste text directly and it will auto-assign speakers.""",
             else:
                 # Fallback to default
                 example_scripts = [
-                    [2, "Speaker 0: Welcome to our AI podcast demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
+                    [2, "Speaker 0: Welcome to our AI Audio demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
                 ]
             
             # Randomly select one
@@ -1279,9 +1279,9 @@ Or paste text directly and it will auto-assign speakers.""",
         gr.Markdown("""
         ### 💡 **Usage Tips**
         
-        - Click **🚀 Generate Podcast** to start audio generation
+        - Click **🚀 Generate Audio** to start audio generation
         - **Live Streaming** tab shows audio as it's generated (may have slight pauses)
-        - **Complete Audio** tab provides the full, uninterrupted podcast after generation
+        - **Complete Audio** tab provides the full, uninterrupted Audio after generation
         - During generation, you can click **🛑 Stop Generation** to interrupt the process
         - The streaming indicator shows real-time generation progress
         """)
@@ -1295,7 +1295,7 @@ Or paste text directly and it will auto-assign speakers.""",
         else:
             # Fallback to a simple default example if no scripts loaded
             example_scripts = [
-                [1, "Speaker 1: Welcome to our AI podcast demonstration! This is a sample script showing how the model can generate natural-sounding speech."]
+                [1, "Speaker 1: Welcome to our AI Audio demonstration! This is a sample script showing how the model can generate natural-sounding speech."]
             ]
         
         gr.Examples(
@@ -1388,7 +1388,7 @@ def main():
     try:
         interface.queue(
             max_size=20,  # Maximum queue size
-            default_concurrency_limit=1  # Process one request at a time
+            default_concurrency_limit=4  # Process four requests at a time
         ).launch(
             share=True,
             # server_port=args.port,
