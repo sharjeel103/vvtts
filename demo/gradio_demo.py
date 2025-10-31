@@ -19,7 +19,7 @@ import soundfile as sf
 import torch
 import os
 import traceback
-import rubberband.pyrb as pyrb  # <-- 1. Add this import
+import pyrubberband as pyrb
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
