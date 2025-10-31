@@ -82,7 +82,7 @@ class RSRTTSDemo:
                 self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                     self.model_path,
                     torch_dtype=load_dtype,
-                    device_map="cuda",
+                    device_map="auto",  # <-- Changed from "cuda" to "auto"
                     attn_implementation=attn_impl_primary,
                 )
             else:
@@ -98,14 +98,31 @@ class RSRTTSDemo:
                 print(traceback.format_exc())
                 fallback_attn = "sdpa"
                 print(f"Falling back to attention implementation: {fallback_attn}")
-                self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                    self.model_path,
-                    torch_dtype=load_dtype,
-                    device_map=(self.device if self.device in ("cuda", "cpu") else None),
-                    attn_implementation=fallback_attn,
-                )
+                
+                # --- START FIX: Replicate device_map logic in exception block ---
                 if self.device == "mps":
+                    self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+                        self.model_path,
+                        torch_dtype=load_dtype,
+                        attn_implementation=fallback_attn,
+                        device_map=None,
+                    )
                     self.model.to("mps")
+                elif self.device == "cuda":
+                    self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+                        self.model_path,
+                        torch_dtype=load_dtype,
+                        device_map="auto", # <-- FIX: Use "auto" here as well
+                        attn_implementation=fallback_attn,
+                    )
+                else: # self.device == "cpu"
+                    self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+                        self.model_path,
+                        torch_dtype=load_dtype,
+                        device_map="cpu",
+                        attn_implementation=fallback_attn,
+                    )
+                # --- END FIX ---
             else:
                 raise e
         self.model.eval()
