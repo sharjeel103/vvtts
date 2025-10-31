@@ -19,6 +19,7 @@ import soundfile as sf
 import torch
 import os
 import traceback
+import rubberband.pyrb as pyrb  # <-- 1. Add this import
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
@@ -175,12 +176,13 @@ class RSRTTSDemo:
             print(f"Error reading audio {audio_path}: {e}")
             return np.array([])
 
-    def _adjust_voice_speed(self, audio_np: np.ndarray, speed_factor: float) -> np.ndarray:
+    def _adjust_voice_speed(self, audio_np: np.ndarray, speed_factor: float, sample_rate: int = 24000) -> np.ndarray:
         """Adjust voice speed using time-stretching without changing pitch.
 
         Args:
             audio_np: Input audio array (float32).
             speed_factor: Speed adjustment (0.8 = slower, 1.2 = faster).
+            sample_rate: The sample rate of the audio.
 
         Returns:
             Speed-adjusted audio array.
@@ -188,10 +190,10 @@ class RSRTTSDemo:
         if speed_factor == 1.0:
             return audio_np  # No change needed
         
-        # Use librosa.effects.time_stretch for high-quality pitch-invariant speed change
+        # Use pyrubberband for high-quality, pitch-invariant speed change
         try:
-            # Note: librosa.effects.time_stretch expects float32
-            adjusted_audio = librosa.effects.time_stretch(y=audio_np, rate=speed_factor)
+            # 2. Use pyrb.time_stretch instead of librosa
+            adjusted_audio = pyrb.time_stretch(y=audio_np, sr=sample_rate, rate=speed_factor)
             
             original_length = len(audio_np)
             target_length = len(adjusted_audio)
@@ -286,7 +288,8 @@ class RSRTTSDemo:
                 speed_factor = speaker_speeds[i]
                 if speed_factor != 1.0:
                     logger.info(f"Applying speed factor {speed_factor:.2f} to Speaker {i+1}")
-                    audio_data = self._adjust_voice_speed(audio_data, speed_factor)
+                    # 3. Pass the sample_rate (which is 24000)
+                    audio_data = self._adjust_voice_speed(audio_data, speed_factor, sample_rate=24000)
                     # Update log name
                     selected_speaker_names_for_log[i] += f" ({speed_factor:.2f}x speed)"
                 # --- END: Apply speed adjustment ---
