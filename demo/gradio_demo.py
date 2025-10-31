@@ -1388,7 +1388,7 @@ def main():
     try:
         interface.queue(
             max_size=20,  # Maximum queue size
-            default_concurrency_limit=4  # Process four requests at a time
+            default_concurrency_limit=1  # Process one request at a time
         ).launch(
             share=True,
             # server_port=args.port,
