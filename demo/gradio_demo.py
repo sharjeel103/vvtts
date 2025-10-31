@@ -174,6 +174,33 @@ class RSRTTSDemo:
         except Exception as e:
             print(f"Error reading audio {audio_path}: {e}")
             return np.array([])
+
+    def _adjust_voice_speed(self, audio_np: np.ndarray, speed_factor: float) -> np.ndarray:
+        """Adjust voice speed using time-stretching without changing pitch.
+
+        Args:
+            audio_np: Input audio array (float32).
+            speed_factor: Speed adjustment (0.8 = slower, 1.2 = faster).
+
+        Returns:
+            Speed-adjusted audio array.
+        """
+        if speed_factor == 1.0:
+            return audio_np  # No change needed
+        
+        # Use librosa.effects.time_stretch for high-quality pitch-invariant speed change
+        try:
+            # Note: librosa.effects.time_stretch expects float32
+            adjusted_audio = librosa.effects.time_stretch(y=audio_np, rate=speed_factor)
+            
+            original_length = len(audio_np)
+            target_length = len(adjusted_audio)
+            logger.info(f"Adjusted voice speed by factor {speed_factor:.2f} ({original_length} -> {target_length} samples)")
+            
+            return adjusted_audio
+        except Exception as e:
+            logger.error(f"Error during voice speed adjustment: {e}. Returning original audio.")
+            return audio_np
     
     def generate_podcast_streaming(self, 
                                  num_speakers: int,
@@ -186,6 +213,10 @@ class RSRTTSDemo:
                                  speaker_2_upload: str = None,
                                  speaker_3_upload: str = None,
                                  speaker_4_upload: str = None,
+                                 speaker_1_speed: float = 1.0,
+                                 speaker_2_speed: float = 1.0,
+                                 speaker_3_speed: float = 1.0,
+                                 speaker_4_speed: float = 1.0,
                                  cfg_scale: float = 1.3) -> Iterator[tuple]:
         try:
             
@@ -208,6 +239,7 @@ class RSRTTSDemo:
             # --- New Logic: Handle custom uploads and dropdowns ---
             speaker_dropdowns = [speaker_1, speaker_2, speaker_3, speaker_4]
             speaker_uploads = [speaker_1_upload, speaker_2_upload, speaker_3_upload, speaker_4_upload]
+            speaker_speeds = [speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed] # <-- NEW
             
             selected_audio_paths = [] # This will store the final paths to load
             selected_speaker_names_for_log = [] # For logging
@@ -249,6 +281,16 @@ class RSRTTSDemo:
                 if len(audio_data) == 0:
                     self.is_generating = False
                     raise gr.Error(f"Error: Failed to load audio for {selected_speaker_names_for_log[i]}")
+                
+                # --- START: Apply speed adjustment ---
+                speed_factor = speaker_speeds[i]
+                if speed_factor != 1.0:
+                    logger.info(f"Applying speed factor {speed_factor:.2f} to Speaker {i+1}")
+                    audio_data = self._adjust_voice_speed(audio_data, speed_factor)
+                    # Update log name
+                    selected_speaker_names_for_log[i] += f" ({speed_factor:.2f}x speed)"
+                # --- END: Apply speed adjustment ---
+                
                 voice_samples.append(audio_data)
             
             # log += f"✅ Loaded {len(voice_samples)} voice samples\n"
@@ -998,6 +1040,7 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
 
                 speaker_selections = []
                 speaker_uploads = []
+                speaker_speed_sliders = [] # <-- NEW
                 speaker_groups = []
                 for i in range(4):
                     with gr.Group(visible=(i < 2), elem_classes="speaker-item") as speaker_group:
@@ -1012,8 +1055,20 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
                             type="filepath",  # Use filepath to get a temp path to the uploaded file
                             sources=["upload", "microphone"],
                         )
+                        # --- START: Add speed slider ---
+                        speaker_speed = gr.Slider(
+                            minimum=0.8,
+                            maximum=1.2,
+                            value=1.0,
+                            step=0.01,
+                            label="Voice Speed",
+                            info="< 1.0 = Slower, > 1.0 = Faster",
+                            elem_classes="slider-container"
+                        )
+                        # --- END: Add speed slider ---
                     speaker_selections.append(speaker_dd)
                     speaker_uploads.append(speaker_up)
+                    speaker_speed_sliders.append(speaker_speed) # <-- NEW
                     speaker_groups.append(speaker_group)
                 
                 # Advanced settings
@@ -1152,10 +1207,11 @@ Or paste text directly and it will auto-assign speakers.""",
             """Wrapper function to handle the streaming generation call."""
             try:
                 # Extract speakers and parameters
-                # 4 dropdowns + 4 uploads + 1 cfg_scale = 9 params
+                # 4 dropdowns + 4 uploads + 4 speed + 1 cfg_scale = 13 params
                 dropdown_selections = speakers_and_params[0:4]
                 upload_selections = speakers_and_params[4:8]
-                cfg_scale = speakers_and_params[8]
+                speed_selections = speakers_and_params[8:12] # <-- NEW
+                cfg_scale = speakers_and_params[12] # <-- Index updated
                 
                 # Clear outputs and reset visibility at start
                 yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
@@ -1174,6 +1230,10 @@ Or paste text directly and it will auto-assign speakers.""",
                     speaker_2_upload=upload_selections[1],
                     speaker_3_upload=upload_selections[2],
                     speaker_4_upload=upload_selections[3],
+                    speaker_1_speed=speed_selections[0], # <-- NEW
+                    speaker_2_speed=speed_selections[1], # <-- NEW
+                    speaker_3_speed=speed_selections[2], # <-- NEW
+                    speaker_4_speed=speed_selections[3], # <-- NEW
                     cfg_scale=cfg_scale
                 ):
                     final_log = log
@@ -1222,7 +1282,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + speaker_uploads + [cfg_scale], # Pass both lists
+            inputs=[num_speakers, script_input] + speaker_selections + speaker_uploads + speaker_speed_sliders + [cfg_scale], # Pass all lists
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
