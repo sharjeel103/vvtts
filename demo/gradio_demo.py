@@ -85,7 +85,7 @@ class RSRTTSDemo:
                     # This is the exact logic from your reference file.
                     bnb_config = BitsAndBytesConfig(
                         load_in_8bit=True,
-                        bnb_8bit_compute_dtype=torch.bfloat16,
+                        bnb_8bit_compute_dtype=torch.float16, # <-- FIX: Was torch.bfloat16
                         # CRITICAL: Skip all audio-related components to prevent noise
                         llm_int8_skip_modules=[
                             "lm_head",              # Output projection
