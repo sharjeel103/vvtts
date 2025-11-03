@@ -32,7 +32,8 @@ dependencies = [
     "gradio",
     "av",
     "aiortc",
-    "pyrubberband"
+    "pyrubberband",
+    "bitsandbytes"
 ]
 
 
