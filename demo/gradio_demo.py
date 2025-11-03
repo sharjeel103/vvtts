@@ -26,7 +26,7 @@ from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForCondition
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.streamer import AudioStreamer
 from transformers.utils import logging
-from transformers import set_seed
+from transformers import set_seed, BitsAndBytesConfig  # <-- ADDED BitsAndBytesConfig
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -38,6 +38,7 @@ class RSRTTSDemo:
         self.model_path = model_path
         self.device = device
         self.inference_steps = inference_steps
+        self.use_8bit = use_8bit  # <-- ADDED
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
@@ -55,9 +56,9 @@ class RSRTTSDemo:
         if self.device == "mps" and not torch.backends.mps.is_available():
             print("Warning: MPS not available. Falling back to CPU.")
             self.device = "cpu"
-        print(f"Using device: {self.device}")
-        # Load processor
-        self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
+        
+        # --- START: 8-bit Quantization and Model Kwargs Setup ---
+        
         # Decide dtype & attention
         if self.device == "mps":
             load_dtype = torch.float32
@@ -68,44 +69,90 @@ class RSRTTSDemo:
         else:
             load_dtype = torch.float32
             attn_impl_primary = "sdpa"
+            
         print(f"Using device: {self.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
+        
+        model_kwargs = {} # Will hold all arguments for from_pretrained
+
+        if self.use_8bit:
+            print("Attempting to load LLM component in 8-bit mode...")
+            if self.device != "cuda":
+                print("Warning: 8-bit quantization requires a CUDA GPU. Falling back to default loading.")
+                self.use_8bit = False # Disable it if not on CUDA
+            else:
+                try:
+                    # Configure 8-bit quantization for LLM only
+                    # This is the exact logic from your reference file.
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        bnb_8bit_compute_dtype=torch.bfloat16,
+                        # CRITICAL: Skip all audio-related components to prevent noise
+                        llm_int8_skip_modules=[
+                            "lm_head",              # Output projection
+                            "prediction_head",      # Diffusion head - CRITICAL for audio quality
+                            "acoustic_connector",   # Audio->LLM projection - CRITICAL
+                            "semantic_connector",   # Semantic->LLM projection - CRITICAL
+                            "acoustic_tokenizer",   # VAE encoder/decoder for audio
+                            "semantic_tokenizer",   # VAE encoder for semantics
+                        ],
+                        # Stability threshold
+                        llm_int8_threshold=3.0,
+                        llm_int8_has_fp16_weight=False,
+                    )
+
+                    model_kwargs["quantization_config"] = bnb_config
+                    model_kwargs["device_map"] = "auto" # Force auto device map for bitsandbytes
+                    print("✅ Applied 8-bit quantization config. device_map set to 'auto'.")
+
+                except ImportError:
+                    print("❌ Error: bitsandbytes is not installed. 8-bit quantization failed.")
+                    print("Please install with: pip install bitsandbytes")
+                    self.use_8bit = False # Disable if import failed
+                except Exception as e:
+                    print(f"❌ Error setting up BitsAndBytesConfig: {e}")
+                    self.use_8bit = False
+        
+        if not self.use_8bit:
+            # Set default device_map if not using 8-bit
+            if self.device == "mps":
+                model_kwargs["device_map"] = None
+            elif self.device == "cuda":
+                # Use "auto" for multi-GPU support even without 8-bit
+                model_kwargs["device_map"] = "auto" 
+            else: # self.device == "cpu"
+                model_kwargs["device_map"] = "cpu"
+                
+        # --- END: 8-bit Quantization and Model Kwargs Setup ---
+        
+        # Load processor
+        self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
+
         # Load model
         try:
-            if self.device == "mps":
-                self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                    self.model_path,
-                    torch_dtype=load_dtype,
-                    attn_implementation=attn_impl_primary,
-                    device_map=None,
-                )
-                self.model.to("mps")
-            elif self.device == "cuda":
-                self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                    self.model_path,
-                    torch_dtype=load_dtype,
-                    device_map="cuda",
-                    attn_implementation=attn_impl_primary,
-                )
-            else:
-                self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                    self.model_path,
-                    torch_dtype=load_dtype,
-                    device_map="cpu",
-                    attn_implementation=attn_impl_primary,
-                )
+            self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+                self.model_path,
+                torch_dtype=load_dtype,
+                attn_implementation=attn_impl_primary,
+                **model_kwargs  # Pass all kwargs (quantization, device_map, etc.)
+            )
+            if self.device == "mps" and not self.use_8bit:
+                self.model.to("mps") # Manual .to("mps") still needed if not using device_map
+
         except Exception as e:
             if attn_impl_primary == 'flash_attention_2':
                 print(f"[ERROR] : {type(e).__name__}: {e}")
                 print(traceback.format_exc())
                 fallback_attn = "sdpa"
                 print(f"Falling back to attention implementation: {fallback_attn}")
+                
+                # Retry loading with fallback attention and same kwargs
                 self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
                     self.model_path,
                     torch_dtype=load_dtype,
-                    device_map=(self.device if self.device in ("cuda", "cpu") else None),
                     attn_implementation=fallback_attn,
+                    **model_kwargs # Pass all kwargs again
                 )
-                if self.device == "mps":
+                if self.device == "mps" and not self.use_8bit:
                     self.model.to("mps")
             else:
                 raise e
@@ -201,7 +248,8 @@ class RSRTTSDemo:
             
             return adjusted_audio
         except Exception as e:
-            logger.error(f"Error during voice speed adjustment: {e}. Returning original audio.")
+            logger.error(f"Error during voice speed adjustment (pyrubberband): {e}.")
+            logger.warning("Falling back to original audio.")
             return audio_np
     
     def generate_podcast_streaming(self, 
@@ -241,7 +289,7 @@ class RSRTTSDemo:
             # --- New Logic: Handle custom uploads and dropdowns ---
             speaker_dropdowns = [speaker_1, speaker_2, speaker_3, speaker_4]
             speaker_uploads = [speaker_1_upload, speaker_2_upload, speaker_3_upload, speaker_4_upload]
-            speaker_speeds = [speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed] # <-- NEW
+            speaker_speeds = [speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed]
             
             selected_audio_paths = [] # This will store the final paths to load
             selected_speaker_names_for_log = [] # For logging
@@ -268,7 +316,6 @@ class RSRTTSDemo:
             # Build initial log
             log = f"🎙️ Generating Audio with {num_speakers} speakers\n"
             log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
-            log += f"🎭 Speakers: {', '.join(selected_speaker_names_for_log)}\n"
             
             # Check for stop signal
             if self.stop_generation:
@@ -288,7 +335,7 @@ class RSRTTSDemo:
                 speed_factor = speaker_speeds[i]
                 if speed_factor != 1.0:
                     logger.info(f"Applying speed factor {speed_factor:.2f} to Speaker {i+1}")
-                    # 3. Pass the sample_rate (which is 24000)
+                    # Pass the target sample rate (24000)
                     audio_data = self._adjust_voice_speed(audio_data, speed_factor, sample_rate=24000)
                     # Update log name
                     selected_speaker_names_for_log[i] += f" ({speed_factor:.2f}x speed)"
@@ -296,7 +343,8 @@ class RSRTTSDemo:
                 
                 voice_samples.append(audio_data)
             
-            # log += f"✅ Loaded {len(voice_samples)} voice samples\n"
+            # Add speaker names to log *after* speed adjustment
+            log += f"🎭 Speakers: {', '.join(selected_speaker_names_for_log)}\n"
             
             # Check for stop signal
             if self.stop_generation:
@@ -340,8 +388,14 @@ class RSRTTSDemo:
                 return_tensors="pt",
                 return_attention_mask=True,
             )
+            
             # Move tensors to device
-            target_device = self.device if self.device in ("cuda", "mps") else "cpu"
+            # For 8-bit mode, model is already on device. For others, get device from model.
+            if self.use_8bit:
+                target_device = self.model.device
+            else:
+                target_device = self.device if self.device in ("cuda", "mps") else "cpu"
+                
             for k, v in inputs.items():
                 if torch.is_tensor(v):
                     inputs[k] = v.to(target_device)
@@ -1043,7 +1097,7 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
 
                 speaker_selections = []
                 speaker_uploads = []
-                speaker_speed_sliders = [] # <-- NEW
+                speaker_speed_sliders = []
                 speaker_groups = []
                 for i in range(4):
                     with gr.Group(visible=(i < 2), elem_classes="speaker-item") as speaker_group:
@@ -1058,7 +1112,7 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
                             type="filepath",  # Use filepath to get a temp path to the uploaded file
                             sources=["upload", "microphone"],
                         )
-                        # --- START: Add speed slider ---
+                        # --- Add speed slider ---
                         speaker_speed = gr.Slider(
                             minimum=0.8,
                             maximum=1.2,
@@ -1068,10 +1122,9 @@ def create_demo_interface(demo_instance: RSRTTSDemo):
                             info="< 1.0 = Slower, > 1.0 = Faster",
                             elem_classes="slider-container"
                         )
-                        # --- END: Add speed slider ---
                     speaker_selections.append(speaker_dd)
                     speaker_uploads.append(speaker_up)
-                    speaker_speed_sliders.append(speaker_speed) # <-- NEW
+                    speaker_speed_sliders.append(speaker_speed)
                     speaker_groups.append(speaker_group)
                 
                 # Advanced settings
@@ -1213,8 +1266,8 @@ Or paste text directly and it will auto-assign speakers.""",
                 # 4 dropdowns + 4 uploads + 4 speed + 1 cfg_scale = 13 params
                 dropdown_selections = speakers_and_params[0:4]
                 upload_selections = speakers_and_params[4:8]
-                speed_selections = speakers_and_params[8:12] # <-- NEW
-                cfg_scale = speakers_and_params[12] # <-- Index updated
+                speed_selections = speakers_and_params[8:12]
+                cfg_scale = speakers_and_params[12]
                 
                 # Clear outputs and reset visibility at start
                 yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
@@ -1233,10 +1286,10 @@ Or paste text directly and it will auto-assign speakers.""",
                     speaker_2_upload=upload_selections[1],
                     speaker_3_upload=upload_selections[2],
                     speaker_4_upload=upload_selections[3],
-                    speaker_1_speed=speed_selections[0], # <-- NEW
-                    speaker_2_speed=speed_selections[1], # <-- NEW
-                    speaker_3_speed=speed_selections[2], # <-- NEW
-                    speaker_4_speed=speed_selections[3], # <-- NEW
+                    speaker_1_speed=speed_selections[0],
+                    speaker_2_speed=speed_selections[1],
+                    speaker_3_speed=speed_selections[2],
+                    speaker_4_speed=speed_selections[3],
                     cfg_scale=cfg_scale
                 ):
                     final_log = log
@@ -1419,6 +1472,11 @@ def parse_args():
         default=7860,
         help="Port to run the demo on",
     )
+    parser.add_argument(
+        "--8bit",
+        action="store_true",
+        help="Enable 8-bit quantization for the LLM component (requires bitsandbytes)",
+    )
     
     return parser.parse_args()
 
@@ -1435,7 +1493,8 @@ def main():
     demo_instance = RSRTTSDemo(
         model_path=args.model_path,
         device=args.device,
-        inference_steps=args.inference_steps
+        inference_steps=args.inference_steps,
+        use_8bit=args.8bit  # <-- Pass the flag
     )
     
     # Create interface
@@ -1444,6 +1503,7 @@ def main():
     print(f"🚀 Launching demo on port {args.port}")
     print(f"📁 Model path: {args.model_path}")
     print(f"🎭 Available voices: {len(demo_instance.available_voices)}")
+    print(f"🔥 8-bit LLM Quantization: {'ENABLED' if args.8bit else 'DISABLED'}")
     print(f"🔴 Streaming mode: ENABLED")
     print(f"🔒 Session isolation: ENABLED")
     
