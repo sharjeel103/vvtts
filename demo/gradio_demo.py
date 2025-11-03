@@ -21,10 +21,6 @@ import os
 import traceback
 import pyrubberband as pyrb
 
-# Set environment variables for cuBLAS compatibility with bitsandbytes on T4 GPUs
-# Note: Don't modify CUDA_VISIBLE_DEVICES here as it can interfere with device detection
-os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
-
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -89,63 +85,33 @@ class RSRTTSDemo:
 
         if self.use_8bit:
             print("Attempting to load LLM component in 8-bit mode...")
-            
-            # Verify CUDA is actually available
-            if self.device != "cuda" or not torch.cuda.is_available():
+            if self.device != "cuda":
                 print("Warning: 8-bit quantization requires a CUDA GPU. Falling back to default loading.")
                 self.use_8bit = False # Disable it if not on CUDA
             else:
                 try:
-                    # Import bitsandbytes and verify CUDA support
-                    import bitsandbytes as bnb
-                    from transformers.integrations import is_bitsandbytes_available
-                    
-                    # Check if bitsandbytes is properly installed and can see CUDA
-                    if not is_bitsandbytes_available():
-                        print("Warning: bitsandbytes is not properly installed. Falling back to default loading.")
-                        self.use_8bit = False
-                    else:
-                        # Try to check CUDA availability through bitsandbytes
-                        try:
-                            # Some versions of bitsandbytes require explicit CUDA check
-                            if hasattr(bnb, 'cuda') and hasattr(bnb.cuda, 'is_available'):
-                                cuda_available = bnb.cuda.is_available()
-                            else:
-                                # Fallback to torch CUDA check
-                                cuda_available = torch.cuda.is_available()
-                            
-                            if not cuda_available:
-                                print("Warning: CUDA is not available to bitsandbytes. Falling back to default loading.")
-                                self.use_8bit = False
-                            else:
-                                # Configure 8-bit quantization for LLM only
-                                # Use only valid parameters for current BitsAndBytesConfig
-                                # Note: bnb_8bit_compute_dtype is removed as it's deprecated
-                                bnb_config = BitsAndBytesConfig(
-                                    load_in_8bit=True,
-                                    # CRITICAL: Skip all audio-related components to prevent noise
-                                    llm_int8_skip_modules=[
-                                        "lm_head",              # Output projection
-                                        "prediction_head",      # Diffusion head - CRITICAL for audio quality
-                                        "acoustic_connector",   # Audio->LLM projection - CRITICAL
-                                        "semantic_connector",   # Semantic->LLM projection - CRITICAL
-                                        "acoustic_tokenizer",   # VAE encoder/decoder for audio
-                                        "semantic_tokenizer",   # VAE encoder for semantics
-                                    ],
-                                    # Stability threshold
-                                    llm_int8_threshold=3.0,
-                                    llm_int8_has_fp16_weight=False,
-                                )
+                    # Configure 8-bit quantization for LLM only
+                    # This is the exact logic from your reference file.
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        bnb_8bit_compute_dtype=torch.float16, # <-- FIX: Was torch.bfloat16
+                        # CRITICAL: Skip all audio-related components to prevent noise
+                        llm_int8_skip_modules=[
+                            "lm_head",              # Output projection
+                            "prediction_head",      # Diffusion head - CRITICAL for audio quality
+                            "acoustic_connector",   # Audio->LLM projection - CRITICAL
+                            "semantic_connector",   # Semantic->LLM projection - CRITICAL
+                            "acoustic_tokenizer",   # VAE encoder/decoder for audio
+                            "semantic_tokenizer",   # VAE encoder for semantics
+                        ],
+                        # Stability threshold
+                        llm_int8_threshold=3.0,
+                        llm_int8_has_fp16_weight=False,
+                    )
 
-                                model_kwargs["quantization_config"] = bnb_config
-                                # Use "cuda" instead of "auto" for explicit device placement
-                                model_kwargs["device_map"] = "cuda"
-                                print("✅ Applied 8-bit quantization config. device_map set to 'cuda'.")
-                                print(f"   CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
-                        except Exception as cuda_check_error:
-                            print(f"Warning: Error checking CUDA availability: {cuda_check_error}")
-                            print("   Falling back to default loading.")
-                            self.use_8bit = False
+                    model_kwargs["quantization_config"] = bnb_config
+                    model_kwargs["device_map"] = "auto" # Force auto device map for bitsandbytes
+                    print("✅ Applied 8-bit quantization config. device_map set to 'auto'.")
 
                 except ImportError:
                     print("❌ Error: bitsandbytes is not installed. 8-bit quantization failed.")
@@ -153,9 +119,6 @@ class RSRTTSDemo:
                     self.use_8bit = False # Disable if import failed
                 except Exception as e:
                     print(f"❌ Error setting up BitsAndBytesConfig: {e}")
-                    print(f"   Error type: {type(e).__name__}")
-                    import traceback
-                    traceback.print_exc()
                     self.use_8bit = False
         
         if not self.use_8bit:
@@ -173,26 +136,6 @@ class RSRTTSDemo:
         # Load processor
         self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
 
-        # For 8-bit quantization, ensure CUDA is properly initialized before loading
-        if self.use_8bit and self.device == "cuda":
-            try:
-                # Initialize CUDA device to ensure it's visible to bitsandbytes
-                if torch.cuda.is_available():
-                    # Create a dummy tensor to initialize CUDA context
-                    _ = torch.zeros(1).cuda()
-                    print(f"✅ CUDA initialized. Device count: {torch.cuda.device_count()}")
-                    print(f"   Current device: {torch.cuda.current_device()}")
-                    print(f"   Device name: {torch.cuda.get_device_name(0)}")
-            except Exception as e:
-                print(f"⚠️  Warning: Could not initialize CUDA: {e}")
-                print("   Falling back to default loading.")
-                self.use_8bit = False
-                # Remove quantization config if we're disabling 8-bit
-                if "quantization_config" in model_kwargs:
-                    del model_kwargs["quantization_config"]
-                if "device_map" in model_kwargs:
-                    model_kwargs["device_map"] = "cuda" if self.device == "cuda" else None
-
         # Load model
         try:
             self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
@@ -204,40 +147,8 @@ class RSRTTSDemo:
             if self.device == "mps" and not self.use_8bit:
                 self.model.to("mps") # Manual .to("mps") still needed if not using device_map
 
-        except RuntimeError as e:
-            # Check if this is a bitsandbytes device detection error
-            error_msg = str(e)
-            if "bitsandbytes" in error_msg.lower() and ("available_devices" in error_msg or "backend" in error_msg.lower()):
-                print(f"⚠️  bitsandbytes device detection error: {e}")
-                print("   Attempting to load without 8-bit quantization...")
-                
-                # Disable 8-bit and remove quantization config
-                self.use_8bit = False
-                if "quantization_config" in model_kwargs:
-                    del model_kwargs["quantization_config"]
-                # Reset device_map to standard CUDA if using CUDA
-                if self.device == "cuda":
-                    model_kwargs["device_map"] = "cuda"
-                elif self.device == "mps":
-                    model_kwargs["device_map"] = None
-                else:
-                    model_kwargs["device_map"] = "cpu"
-                
-                # Retry loading without quantization
-                try:
-                    self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                        self.model_path,
-                        torch_dtype=load_dtype,
-                        attn_implementation=attn_impl_primary,
-                        **model_kwargs
-                    )
-                    if self.device == "mps":
-                        self.model.to("mps")
-                    print("✅ Successfully loaded model without 8-bit quantization")
-                except Exception as retry_error:
-                    print(f"❌ Error loading model without quantization: {retry_error}")
-                    raise retry_error
-            elif attn_impl_primary == 'flash_attention_2':
+        except Exception as e:
+            if attn_impl_primary == 'flash_attention_2':
                 print(f"[ERROR] : {type(e).__name__}: {e}")
                 print(traceback.format_exc())
                 fallback_attn = "sdpa"
@@ -255,39 +166,6 @@ class RSRTTSDemo:
             else:
                 raise e
         self.model.eval()
-        
-        # Fix for cuBLAS error with 8-bit quantization on T4 GPUs
-        # Ensure inputs are contiguous before quantized operations
-        if self.use_8bit:
-            try:
-                import bitsandbytes as bnb
-                from bitsandbytes.nn import Linear8bitLt
-                
-                # Disable problematic CUDA optimizations that can interfere with quantized ops
-                if torch.backends.cudnn.is_available():
-                    torch.backends.cudnn.benchmark = False
-                    torch.backends.cudnn.deterministic = True
-                
-                # Store original forward method of Linear8bitLt
-                original_linear8bit_forward = Linear8bitLt.forward
-                
-                def patched_linear8bit_forward(self_linear, input, *args, **kwargs):
-                    # Ensure input is contiguous before quantized matrix multiplication
-                    # This fixes cuBLAS errors on T4 GPUs with bitsandbytes
-                    if input is not None and not input.is_contiguous():
-                        input = input.contiguous()
-                    # Call original forward with contiguous tensor
-                    return original_linear8bit_forward(self_linear, input, *args, **kwargs)
-                
-                # Patch the Linear8bitLt class to ensure contiguous inputs
-                Linear8bitLt.forward = patched_linear8bit_forward
-                
-                print("✅ Applied cuBLAS compatibility patch for 8-bit quantization")
-                print("   - Ensured inputs are contiguous before quantized operations")
-                print("   - Disabled CUDA optimizations that may interfere")
-            except Exception as e:
-                print(f"⚠️  Warning: Could not apply cuBLAS patch: {e}")
-                print("   The model may still work, but cuBLAS errors may occur.")
         
         # Use SDE solver by default
         self.model.model.noise_scheduler = self.model.model.noise_scheduler.from_config(
