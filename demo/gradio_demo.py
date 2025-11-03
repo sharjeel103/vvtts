@@ -64,11 +64,20 @@ class RSRTTSDemo:
             load_dtype = torch.float32
             attn_impl_primary = "sdpa"
         elif self.device == "cuda":
-            load_dtype = torch.bfloat16
+            load_dtype = torch.float16
             attn_impl_primary = "flash_attention_2"
         else:
             load_dtype = torch.float32
             attn_impl_primary = "sdpa"
+            
+        # --- START FIX: Force float16 for 8-bit on T4 ---
+        # If using 8-bit, we MUST use float16 for everything (model and compute)
+        # to avoid bfloat16 -> float16 casting errors inside cuBLAS,
+        # especially on T4 GPUs which have poor bfloat16 support.
+        if self.use_8bit and self.device == "cuda":
+            print("8-bit mode enabled. Forcing load_dtype and compute_dtype to torch.float16 for stability.")
+            load_dtype = torch.float16
+        # --- END FIX ---
             
         print(f"Using device: {self.device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
         
