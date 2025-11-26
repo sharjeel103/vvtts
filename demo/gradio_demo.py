@@ -41,6 +41,11 @@ class RSRTTSDemo:
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
+        
+        # Ensure output directory exists immediately
+        self.output_dir = "saved_outputs"
+        os.makedirs(self.output_dir, exist_ok=True)
+        
         self.load_model()
         self.setup_voice_presets()
         self.load_example_scripts()  # Load example scripts
@@ -220,6 +225,13 @@ class RSRTTSDemo:
                                  speaker_3_speed: float = 1.0,
                                  speaker_4_speed: float = 1.0,
                                  cfg_scale: float = 1.3) -> Iterator[tuple]:
+        
+        # Setup output directory for local saving (redundant check but safe)
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create output directory: {e}")
+
         try:
             
             # Reset stop flag and set generating state
@@ -467,9 +479,7 @@ class RSRTTSDemo:
                         complete_audio = np.concatenate(all_audio_chunks)
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"rsr_tts_{timestamp}.wav"
-                        # Save to current working directory (where the script is running)
-                        cwd = os.getcwd()
-                        filepath = os.path.join(cwd, filename)
+                        filepath = os.path.join(self.output_dir, filename)
                         
                         # Save using soundfile
                         sf.write(filepath, complete_audio, sample_rate)
@@ -684,6 +694,22 @@ class RSRTTSDemo:
         else:
             # Assume 1-based indexing, return the count
             return len(speakers)
+    
+    def get_saved_files(self) -> List[str]:
+        """Get list of saved audio files sorted by creation time (newest first)."""
+        if not os.path.exists(self.output_dir):
+            return []
+            
+        try:
+            # Get all wav files
+            files = [os.path.join(self.output_dir, f) for f in os.listdir(self.output_dir) 
+                    if f.lower().endswith('.wav')]
+            # Sort by modification time, newest first
+            files.sort(key=os.path.getmtime, reverse=True)
+            return files
+        except Exception as e:
+            print(f"Error listing saved files: {e}")
+            return []
     
 
 def create_demo_interface(demo_instance: RSRTTSDemo):
@@ -1216,6 +1242,30 @@ Or paste text directly and it will auto-assign speakers.""",
                     elem_classes="log-output"
                 )
         
+        # --- New Section: Saved Files ---
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 📂 **Saved Audio Files**")
+                gr.Markdown("All generated audio is automatically saved locally. Click refresh to see the latest files.")
+                
+                with gr.Row():
+                    refresh_files_btn = gr.Button("🔄 Refresh File List", variant="secondary", size="sm", scale=0)
+                
+                saved_files_output = gr.File(
+                    label="History (Downloadable)",
+                    file_count="multiple",
+                    type="filepath",
+                    interactive=False,
+                    value=demo_instance.get_saved_files  # Load initially
+                )
+                
+                # Connect refresh button
+                refresh_files_btn.click(
+                    fn=demo_instance.get_saved_files,
+                    inputs=[],
+                    outputs=[saved_files_output]
+                )
+        
         def update_speaker_visibility(num_speakers):
             updates = []
             for i in range(4):
@@ -1311,6 +1361,11 @@ Or paste text directly and it will auto-assign speakers.""",
             inputs=[num_speakers, script_input] + speaker_selections + speaker_uploads + speaker_speed_sliders + [cfg_scale], # Pass all lists
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
+        ).then( # Auto-refresh file list after generation finishes
+            fn=demo_instance.get_saved_files,
+            inputs=[],
+            outputs=[saved_files_output],
+            queue=False
         )
         
         # Connect stop button
