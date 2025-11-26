@@ -467,7 +467,9 @@ class RSRTTSDemo:
                         complete_audio = np.concatenate(all_audio_chunks)
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"rsr_tts_{timestamp}.wav"
-                        filepath = os.path.join(output_dir, filename)
+                        # Save to current working directory (where the script is running)
+                        cwd = os.getcwd()
+                        filepath = os.path.join(cwd, filename)
                         
                         # Save using soundfile
                         sf.write(filepath, complete_audio, sample_rate)
