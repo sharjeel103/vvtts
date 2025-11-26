@@ -376,7 +376,7 @@ class RSRTTSDemo:
 
             # Collect audio chunks as they arrive
             sample_rate = 24000
-            all_audio_chunks = []  # For final statistics
+            all_audio_chunks = []  # For final statistics AND local saving
             pending_chunks = []  # Buffer for accumulating small chunks
             chunk_count = 0
             last_yield_time = time.time()
@@ -389,83 +389,104 @@ class RSRTTSDemo:
             has_yielded_audio = False
             has_received_chunks = False  # Track if we received any chunks at all
             
-            for audio_chunk in audio_stream:
-                # Check for stop signal in the streaming loop
-                if self.stop_generation:
-                    audio_streamer.end()
-                    break
+            try:
+                for audio_chunk in audio_stream:
+                    # Check for stop signal in the streaming loop
+                    if self.stop_generation:
+                        audio_streamer.end()
+                        break
+                        
+                    chunk_count += 1
+                    has_received_chunks = True  # Mark that we received at least one chunk
                     
-                chunk_count += 1
-                has_received_chunks = True  # Mark that we received at least one chunk
-                
-                # Convert tensor to numpy
-                if torch.is_tensor(audio_chunk):
-                    # Convert bfloat16 to float32 first, then to numpy
-                    if audio_chunk.dtype == torch.bfloat16:
-                        audio_chunk = audio_chunk.float()
-                    audio_np = audio_chunk.cpu().numpy().astype(np.float32)
-                else:
-                    audio_np = np.array(audio_chunk, dtype=np.float32)
-                
-                # Ensure audio is 1D and properly normalized
-                if len(audio_np.shape) > 1:
-                    audio_np = audio_np.squeeze()
-                
-                # Convert to 16-bit for Gradio
-                audio_16bit = convert_to_16_bit_wav(audio_np)
-                
-                # Store for final statistics
-                all_audio_chunks.append(audio_16bit)
-                
-                # Add to pending chunks buffer
-                pending_chunks.append(audio_16bit)
-                
-                # Calculate pending audio size
-                pending_audio_size = sum(len(chunk) for chunk in pending_chunks)
-                current_time = time.time()
-                time_since_last_yield = current_time - last_yield_time
-                
-                # Decide whether to yield
-                should_yield = False
-                if not has_yielded_audio and pending_audio_size >= min_chunk_size:
-                    # First yield: wait for minimum chunk size
-                    should_yield = True
-                    has_yielded_audio = True
-                elif has_yielded_audio and (pending_audio_size >= min_chunk_size or time_since_last_yield >= min_yield_interval):
-                    # Subsequent yields: either enough audio or enough time has passed
-                    should_yield = True
-                
-                if should_yield and pending_chunks:
-                    # Concatenate and yield only the new audio chunks
-                    new_audio = np.concatenate(pending_chunks)
-                    new_duration = len(new_audio) / sample_rate
-                    total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
+                    # Convert tensor to numpy
+                    if torch.is_tensor(audio_chunk):
+                        # Convert bfloat16 to float32 first, then to numpy
+                        if audio_chunk.dtype == torch.bfloat16:
+                            audio_chunk = audio_chunk.float()
+                        audio_np = audio_chunk.cpu().numpy().astype(np.float32)
+                    else:
+                        audio_np = np.array(audio_chunk, dtype=np.float32)
                     
-                    log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
+                    # Ensure audio is 1D and properly normalized
+                    if len(audio_np.shape) > 1:
+                        audio_np = audio_np.squeeze()
                     
-                    # Yield streaming audio chunk and keep complete_audio as None during streaming
-                    yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
+                    # Convert to 16-bit for Gradio
+                    audio_16bit = convert_to_16_bit_wav(audio_np)
                     
-                    # Clear pending chunks after yielding
-                    pending_chunks = []
-                    last_yield_time = current_time
+                    # Store for final statistics
+                    all_audio_chunks.append(audio_16bit)
+                    
+                    # Add to pending chunks buffer
+                    pending_chunks.append(audio_16bit)
+                    
+                    # Calculate pending audio size
+                    pending_audio_size = sum(len(chunk) for chunk in pending_chunks)
+                    current_time = time.time()
+                    time_since_last_yield = current_time - last_yield_time
+                    
+                    # Decide whether to yield
+                    should_yield = False
+                    if not has_yielded_audio and pending_audio_size >= min_chunk_size:
+                        # First yield: wait for minimum chunk size
+                        should_yield = True
+                        has_yielded_audio = True
+                    elif has_yielded_audio and (pending_audio_size >= min_chunk_size or time_since_last_yield >= min_yield_interval):
+                        # Subsequent yields: either enough audio or enough time has passed
+                        should_yield = True
+                    
+                    if should_yield and pending_chunks:
+                        # Concatenate and yield only the new audio chunks
+                        new_audio = np.concatenate(pending_chunks)
+                        new_duration = len(new_audio) / sample_rate
+                        total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
+                        
+                        log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
+                        
+                        # Yield streaming audio chunk and keep complete_audio as None during streaming
+                        yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
+                        
+                        # Clear pending chunks after yielding
+                        pending_chunks = []
+                        last_yield_time = current_time
             
-            # Yield any remaining chunks
-            if pending_chunks:
+            except GeneratorExit:
+                print("Client disconnected during streaming.")
+                # We catch this so the 'finally' block can run and save the audio
+            except Exception as e:
+                print(f"Error during streaming loop: {e}")
+                raise e
+            finally:
+                # --- START: Local File Saving in Finally Block ---
+                # This ensures saving happens even if user disconnects (GeneratorExit)
+                # or if an error occurs.
+                if all_audio_chunks:
+                    try:
+                        print("💾 attempting to save local backup...")
+                        complete_audio = np.concatenate(all_audio_chunks)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"rsr_tts_{timestamp}.wav"
+                        filepath = os.path.join(output_dir, filename)
+                        
+                        # Save using soundfile
+                        sf.write(filepath, complete_audio, sample_rate)
+                        print(f"✅ Audio successfully saved locally to: {filepath}")
+                    except Exception as save_error:
+                        print(f"❌ Failed to save local backup: {save_error}")
+                # --- END: Local File Saving ---
+                
+                # Ensure background thread is cleaned up
+                audio_streamer.end()
+                generation_thread.join(timeout=2.0)
+            
+            # Yield any remaining chunks (if still connected)
+            if pending_chunks and not self.stop_generation:
                 final_new_audio = np.concatenate(pending_chunks)
                 total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
                 log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
                 yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
                 has_yielded_audio = True  # Mark that we yielded audio
-            
-            # Wait for generation to complete (with timeout to prevent hanging)
-            generation_thread.join(timeout=5.0)  # Increased timeout to 5 seconds
-
-            # If thread is still alive after timeout, force end
-            if generation_thread.is_alive():
-                print("Warning: Generation thread did not complete within timeout")
-                audio_streamer.end()
-                generation_thread.join(timeout=5.0)
 
             # Clean up
             self.current_streamer = None
