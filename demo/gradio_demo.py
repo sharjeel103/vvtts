@@ -110,7 +110,7 @@ class RSRTTSDemo:
                     )
 
                     model_kwargs["quantization_config"] = bnb_config
-                    model_kwargs["device_map"] = "auto" # Force auto device map for bitsandbytes
+                    model_kwargs["device_map"] = "cuda" # Force auto device map for bitsandbytes
                     print("✅ Applied 8-bit quantization config. device_map set to 'auto'.")
 
                 except ImportError:
@@ -127,7 +127,7 @@ class RSRTTSDemo:
                 model_kwargs["device_map"] = None
             elif self.device == "cuda":
                 # Use "auto" for multi-GPU support even without 8-bit
-                model_kwargs["device_map"] = "auto" 
+                model_kwargs["device_map"] = "cuda" 
             else: # self.device == "cpu"
                 model_kwargs["device_map"] = "cpu"
                 
