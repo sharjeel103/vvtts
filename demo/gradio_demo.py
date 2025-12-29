@@ -24,6 +24,8 @@ import pyrubberband as pyrb
 import types
 import gc
 from tqdm import tqdm
+import subprocess  
+import math
 
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -34,12 +36,16 @@ from transformers.utils import logging
 from transformers import set_seed
 from vibevoice.modular.modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache
 
+# --- DeepFilterNet Imports (Hard Dependency) ---
+from df.enhance import enhance, init_df, save_audio
+from df.io import load_audio
+
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
 
 class RSRTTSDemo:
-    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 8, auto_device_map: bool = False):
+    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, auto_device_map: bool = False):
         """Initialize the RSR TTS demo with model loading."""
         self.model_path = model_path
         self.device = "cuda" # Enforce CUDA for T4 setup
@@ -49,6 +55,11 @@ class RSRTTSDemo:
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
         
+        # Initialize DeepFilterNet (Always On)
+        print("🎙️ Initializing DeepFilterNet for mandatory denoising...")
+        # init_df() returns model, df_state, encoded_df_state (if any)
+        self.df_model, self.df_state, _ = init_df()
+
         # Performance tuning
         torch.backends.cudnn.benchmark = True
         
@@ -79,25 +90,19 @@ class RSRTTSDemo:
             "attn_implementation": attn_impl_primary,
         }
 
-        # --- DUAL T4 MANUAL SPLIT STRATEGY (OPTIMIZED BALANCE) ---
+        # --- DUAL T4 MANUAL SPLIT STRATEGY ---
         if self.auto_device_map:
             if torch.cuda.device_count() >= 2:
                 print("⚡ Dual GPU detected. Constructing RE-BALANCED manual split map...")
                 device_map = {}
                 
-                # OPTIMIZED BALANCE: 
-                # GPU 1 was heavy (11.3GB) vs GPU 0 (7GB).
-                # Moving 4 more layers to GPU 0.
-                # Split at Layer 18 (0-17 on GPU 0, 18-27 on GPU 1)
-                
-                # --- GPU 0 ---
-                # Embeddings + 18 Layers
+                # OPTIMIZED BALANCE: Split at Layer 18
+                # GPU 0: Embeddings + 18 Layers
                 device_map["model.language_model.embed_tokens"] = 0
                 for i in range(18): 
                     device_map[f"model.language_model.layers.{i}"] = 0
                 
-                # --- GPU 1 ---
-                # 10 Layers + Heads + Overhead
+                # GPU 1: 10 Layers + Heads + Overhead
                 for i in range(18, 28): 
                     device_map[f"model.language_model.layers.{i}"] = 1
                 
@@ -128,14 +133,16 @@ class RSRTTSDemo:
                 **load_kwargs
             )
             
-            
             # --- PATCH 1: _process_speech_inputs (Prefill Stage) ---
             def patched_process_speech_inputs(self, speech_tensors, speech_masks, speech_type="audio"):
                 """Patched version to ensure device compatibility."""
                 with torch.no_grad():
                     # Determine target device from model's input embeddings
-                    target_device = self.model.get_input_embeddings().weight.device
-                    
+                    try:
+                        target_device = self.model.get_input_embeddings().weight.device
+                    except:
+                        target_device = self.device
+
                     if speech_type == "audio":
                         tokenizer_device = self.model.acoustic_tokenizer.device
                         speech_tensors = speech_tensors.to(tokenizer_device)
@@ -527,21 +534,111 @@ class RSRTTSDemo:
             return np.array([])
 
     def _adjust_voice_speed(self, audio_np: np.ndarray, speed_factor: float, sample_rate: int = 24000) -> np.ndarray:
-        """Adjust voice speed using time-stretching without changing pitch."""
+        """Adjust voice speed using time-stretching without changing pitch.
+
+        Args:
+            audio_np: Input audio array (float32).
+            speed_factor: Speed adjustment (0.8 = slower, 1.2 = faster).
+            sample_rate: The sample rate of the audio.
+
+        Returns:
+            Speed-adjusted audio array.
+        """
         if speed_factor == 1.0:
             return audio_np  # No change needed
         
+        # Use pyrubberband for high-quality, pitch-invariant speed change
         try:
-            # Use pyrb.time_stretch instead of librosa
+            # 2. Use pyrb.time_stretch instead of librosa
             adjusted_audio = pyrb.time_stretch(y=audio_np, sr=sample_rate, rate=speed_factor)
+            
             original_length = len(audio_np)
             target_length = len(adjusted_audio)
             logger.info(f"Adjusted voice speed by factor {speed_factor:.2f} ({original_length} -> {target_length} samples)")
+            
             return adjusted_audio
         except Exception as e:
             logger.error(f"Error during voice speed adjustment: {e}. Returning original audio.")
             return audio_np
     
+    # --- DeepFilterNet Denoising Helper ---
+    def denoise_audio(self, audio_np, sample_rate: int = 24000):
+            """
+            Denoise audio using DeepFilterNet.
+            FIX: Keeps input on CPU because df.enhance() requires CPU tensors for feature extraction.
+            """
+            if not self.df_model:
+                return audio_np
+    
+            try:
+                print("🧹 Denoising audio with DeepFilterNet...")
+    
+                # --- SAFETY CHECK 1: Force Input to CPU Numpy ---
+                if torch.is_tensor(audio_np):
+                    audio_np = audio_np.detach().cpu().numpy()
+                
+                audio_np = audio_np.astype(np.float32)
+    
+                # 1. Resample to 48k
+                target_sr = 48000
+                if sample_rate != target_sr:
+                    audio_48k = librosa.resample(audio_np, orig_sr=sample_rate, target_sr=target_sr)
+                else:
+                    audio_48k = audio_np
+    
+                # 2. Setup Chunking
+                total_samples = len(audio_48k)
+                duration_min = total_samples / target_sr / 60
+                MAX_CHUNK_MIN = 7
+                num_parts = math.ceil(duration_min / MAX_CHUNK_MIN)
+                
+                if num_parts <= 1:
+                    chunk_size = total_samples
+                else:
+                    chunk_size = math.ceil(total_samples / num_parts)
+    
+                print(f"   ↳ Audio is {duration_min:.2f} mins. Splitting into {num_parts} parts.")
+    
+                # 3. Process Parts
+                enhanced_parts = []
+                OVERLAP_SEC = 2
+                overlap_samples = int(OVERLAP_SEC * target_sr)
+    
+                for i in range(num_parts):
+                    start = i * chunk_size
+                    end = min(start + chunk_size, total_samples)
+                    pad_left = overlap_samples if i > 0 else 0
+                    input_start = start - pad_left
+                    
+                    chunk_np = audio_48k[input_start:end]
+                    
+                    # --- CRITICAL FIX: Keep on CPU ---
+                    # Do NOT use .to(self.device) here. 'enhance' needs CPU input.
+                    chunk_tensor = torch.from_numpy(chunk_np).float().unsqueeze(0)
+                    
+                    with torch.no_grad():
+                        enhanced_tensor = enhance(self.df_model, self.df_state, chunk_tensor)
+                    
+                    # --- Post-Processing ---
+                    if isinstance(enhanced_tensor, tuple):
+                        enhanced_tensor = enhanced_tensor[0]
+                    
+                    enhanced_tensor = enhanced_tensor.detach().cpu()
+                    enhanced_chunk = enhanced_tensor.squeeze().numpy()
+                    
+                    valid_audio = enhanced_chunk[pad_left:]
+                    enhanced_parts.append(valid_audio)
+                    
+                    del chunk_tensor, enhanced_tensor
+                    torch.cuda.empty_cache()
+    
+                return np.concatenate(enhanced_parts)
+    
+            except Exception as e:
+                print(f"❌ Denoising failed with error: {e}")
+                import traceback
+                traceback.print_exc()
+                return audio_np
     def generate_podcast_streaming(self, 
                                  num_speakers: int,
                                  script: str,
@@ -557,15 +654,17 @@ class RSRTTSDemo:
                                  speaker_2_speed: float = 1.0,
                                  speaker_3_speed: float = 1.0,
                                  speaker_4_speed: float = 1.0,
-                                 cfg_scale: float = 1.3) -> Iterator[tuple]:
+                                 cfg_scale: float = 1.3,
+                                 ) -> Iterator[tuple]:
         
-        # Setup output directory
+        # Setup output directory for local saving (redundant check but safe)
         try:
             os.makedirs(self.output_dir, exist_ok=True)
         except Exception as e:
             print(f"Warning: Could not create output directory: {e}")
 
         try:
+            
             # Reset stop flag and set generating state
             self.stop_generation = False
             self.is_generating = True
@@ -575,39 +674,47 @@ class RSRTTSDemo:
                 self.is_generating = False
                 raise gr.Error("Error: Please provide a script.")
 
+            # Defend against common mistake
             script = script.replace("’", "'")
             
             if num_speakers < 1 or num_speakers > 4:
                 self.is_generating = False
                 raise gr.Error("Error: Number of speakers must be between 1 and 4.")
             
-            # --- Handle custom uploads and dropdowns ---
+            # --- New Logic: Handle custom uploads and dropdowns ---
             speaker_dropdowns = [speaker_1, speaker_2, speaker_3, speaker_4]
             speaker_uploads = [speaker_1_upload, speaker_2_upload, speaker_3_upload, speaker_4_upload]
             speaker_speeds = [speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed]
             
-            selected_audio_paths = [] 
-            selected_speaker_names_for_log = []
+            selected_audio_paths = [] # This will store the final paths to load
+            selected_speaker_names_for_log = [] # For logging
             
+            # Validate and select audio source for each speaker
             for i in range(num_speakers):
                 upload_path = speaker_uploads[i]
                 dropdown_name = speaker_dropdowns[i]
                 
                 if upload_path and os.path.exists(upload_path):
+                    # User uploaded a custom voice
                     selected_audio_paths.append(upload_path)
                     selected_speaker_names_for_log.append(f"Custom (Speaker {i+1})")
                 elif dropdown_name and dropdown_name in self.available_voices:
+                    # User selected from dropdown, and no upload was provided
                     selected_audio_paths.append(self.available_voices[dropdown_name])
                     selected_speaker_names_for_log.append(dropdown_name)
                 else:
+                    # No valid selection for this speaker
                     self.is_generating = False
                     raise gr.Error(f"Error: Please select a default voice or upload a custom voice for Speaker {i+1}.")
+            # --- End New Logic ---
 
             # Build initial log
             log = f"🎙️ Generating Audio with {num_speakers} speakers\n"
             log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
             log += f"🎭 Speakers: {', '.join(selected_speaker_names_for_log)}\n"
+            log += "🧹 Denoising: Enabled (DeepFilterNet, Mandatory)\n"
             
+            # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
@@ -621,20 +728,25 @@ class RSRTTSDemo:
                     self.is_generating = False
                     raise gr.Error(f"Error: Failed to load audio for {selected_speaker_names_for_log[i]}")
                 
+                # --- START: Apply speed adjustment ---
                 speed_factor = speaker_speeds[i]
                 if speed_factor != 1.0:
                     logger.info(f"Applying speed factor {speed_factor:.2f} to Speaker {i+1}")
+                    # 3. Pass the sample_rate (which is 24000)
                     audio_data = self._adjust_voice_speed(audio_data, speed_factor, sample_rate=24000)
+                    # Update log name
                     selected_speaker_names_for_log[i] += f" ({speed_factor:.2f}x speed)"
+                # --- END: Apply speed adjustment ---
                 
                 voice_samples.append(audio_data)
             
+            # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
-            # Parse script
+            # Parse script to assign speaker ID's
             lines = script.strip().split('\n')
             formatted_script_lines = []
             
@@ -642,9 +754,12 @@ class RSRTTSDemo:
                 line = line.strip()
                 if not line:
                     continue
+                    
+                # Check if line already has speaker format
                 if line.startswith('Speaker ') and ':' in line:
                     formatted_script_lines.append(line)
                 else:
+                    # Auto-assign to speakers in rotation
                     speaker_id = len(formatted_script_lines) % num_speakers
                     formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
             
@@ -652,6 +767,7 @@ class RSRTTSDemo:
             log += f"📝 Formatted script with {len(formatted_script_lines)} turns\n\n"
             log += "🔄 Processing (streaming mode)...\n"
             
+            # Check for stop signal before processing
             if self.stop_generation:
                 self.is_generating = False
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
@@ -666,7 +782,8 @@ class RSRTTSDemo:
                 return_tensors="pt",
                 return_attention_mask=True,
             )
-            # Move inputs to device (usually cuda:0)
+            # Move tensors to device - Handle "auto" map where parts are on different devices
+            # For split models, inputs usually go to the first device (cuda:0)
             target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
             
             for k, v in inputs.items():
@@ -679,140 +796,218 @@ class RSRTTSDemo:
                 stop_signal=None,
                 timeout=None
             )
+            
+            # Store current streamer for potential stopping
             self.current_streamer = audio_streamer
             
-            # Start generation thread
+            # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
                 args=(inputs, cfg_scale, audio_streamer)
             )
             generation_thread.start()
             
-            # Wait for start
+            # Wait for generation to actually start producing audio
             time.sleep(1)
 
+            # Check for stop signal after thread start
             if self.stop_generation:
                 audio_streamer.end()
-                generation_thread.join(timeout=5.0)
+                generation_thread.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
                 self.is_generating = False
                 yield None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
 
-            # Collect audio chunks
+            # Collect audio chunks as they arrive
             sample_rate = 24000
-            all_audio_chunks = []
-            pending_chunks = []
+            all_audio_chunks = []  # For final statistics AND local saving
+            pending_chunks = []  # Buffer for accumulating small chunks
             chunk_count = 0
             last_yield_time = time.time()
-            min_yield_interval = 15
-            min_chunk_size = sample_rate * 30
+            min_yield_interval = 15 # Yield every 15 seconds
+            min_chunk_size = sample_rate * 30 # At least 2 seconds of audio
             
+            # Get the stream for the first (and only) sample
             audio_stream = audio_streamer.get_stream(0)
             
             has_yielded_audio = False
-            has_received_chunks = False
+            has_received_chunks = False  # Track if we received any chunks at all
             
             try:
                 for audio_chunk in audio_stream:
+                    # Check for stop signal in the streaming loop
                     if self.stop_generation:
                         audio_streamer.end()
                         break
                         
                     chunk_count += 1
-                    has_received_chunks = True
+                    has_received_chunks = True  # Mark that we received at least one chunk
                     
+                    # Convert tensor to numpy
                     if torch.is_tensor(audio_chunk):
+                        # Convert bfloat16 to float32 first, then to numpy
                         if audio_chunk.dtype == torch.bfloat16:
                             audio_chunk = audio_chunk.float()
+                        # Handle float16
                         elif audio_chunk.dtype == torch.float16:
                             audio_chunk = audio_chunk.float()
+                            
                         audio_np = audio_chunk.cpu().numpy().astype(np.float32)
                     else:
                         audio_np = np.array(audio_chunk, dtype=np.float32)
                     
+                    # Ensure audio is 1D and properly normalized
                     if len(audio_np.shape) > 1:
                         audio_np = audio_np.squeeze()
                     
+                    # Convert to 16-bit for Gradio
                     audio_16bit = convert_to_16_bit_wav(audio_np)
-                    all_audio_chunks.append(audio_16bit)
+                    
+                    # Store for final statistics
+                    all_audio_chunks.append(audio_np) # Store float for high quality re-assembly
+                    
+                    # Add to pending chunks buffer
                     pending_chunks.append(audio_16bit)
                     
+                    # Calculate pending audio size
                     pending_audio_size = sum(len(chunk) for chunk in pending_chunks)
                     current_time = time.time()
                     time_since_last_yield = current_time - last_yield_time
                     
+                    # Decide whether to yield
                     should_yield = False
                     if not has_yielded_audio and pending_audio_size >= min_chunk_size:
+                        # First yield: wait for minimum chunk size
                         should_yield = True
                         has_yielded_audio = True
                     elif has_yielded_audio and (pending_audio_size >= min_chunk_size or time_since_last_yield >= min_yield_interval):
+                        # Subsequent yields: either enough audio or enough time has passed
                         should_yield = True
                     
                     if should_yield and pending_chunks:
+                        # Concatenate and yield only the new audio chunks
                         new_audio = np.concatenate(pending_chunks)
                         total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
+                        
                         log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
+                        
+                        # Yield streaming audio chunk and keep complete_audio as None during streaming
                         yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
+                        
+                        # Clear pending chunks after yielding
                         pending_chunks = []
                         last_yield_time = current_time
             
             except GeneratorExit:
-                print("Client disconnected.")
+                print("Client disconnected during streaming.")
+                # We catch this so the 'finally' block can run and save the audio
             except Exception as e:
                 print(f"Error during streaming loop: {e}")
                 raise e
             finally:
-                if all_audio_chunks:
-                    try:
-                        complete_audio = np.concatenate(all_audio_chunks)
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"rsr_tts_{timestamp}.wav"
-                        filepath = os.path.join(self.output_dir, filename)
-                        sf.write(filepath, complete_audio, sample_rate)
-                        print(f"✅ Audio saved to: {filepath}")
-                    except Exception as save_error:
-                        print(f"❌ Failed to save backup: {save_error}")
-                
+                # Ensure background thread is cleaned up
                 audio_streamer.end()
                 generation_thread.join(timeout=2.0)
             
+            # Yield any remaining chunks (if still connected)
             if pending_chunks and not self.stop_generation:
                 final_new_audio = np.concatenate(pending_chunks)
                 total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
                 log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
                 yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
-                has_yielded_audio = True
+                has_yielded_audio = True  # Mark that we yielded audio
 
+            # Clean up
             self.current_streamer = None
             self.is_generating = False
+            
             generation_time = time.time() - start_time
             
+            # Check if stopped by user
             if self.stop_generation:
                 yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
                 return
             
-            if has_received_chunks and not has_yielded_audio and all_audio_chunks:
-                complete_audio = np.concatenate(all_audio_chunks)
-                final_duration = len(complete_audio) / sample_rate
-                final_log = log + f"⏱️ Completed in {generation_time:.2f}s\n🎵 Duration: {final_duration:.2f}s\n✨ Success!"
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
+            # Process Full Audio (Concatenate + Denoise + Save)
+            if has_received_chunks and all_audio_chunks:
+                # Concatenate full float32 audio
+                complete_audio_float = np.concatenate(all_audio_chunks)
+                # --- SAVE 1: RAW AUDIO ---
+                original_audio_int16 = convert_to_16_bit_wav(complete_audio_float)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                # Save as WAV (Raw)
+                raw_filename = f"rsr_tts_{timestamp}_raw.wav"
+                raw_filepath = os.path.join(self.output_dir, raw_filename)
+                
+                sf.write(raw_filepath, complete_audio_float, sample_rate)
+                print(f"✅ Raw Audio saved to: {raw_filepath}")
+
+
+                final_log = log + f"⏱️ Completed in {generation_time:.2f}s\n🎵 Duration: {len(complete_audio_float) / sample_rate:.2f}s\n"
+                final_log += f"💾 Raw Audio: {raw_filename}\n"
+
+                final_audio_int16 = original_audio_int16
+
+                # --- SAVE 2: DENOISED AUDIO (Mandatory) ---
+                # ... inside your generation loop ...
+                
+                # --- SAVE 2: DENOISED AUDIO ---
+                if self.df_model is not None:
+                    # 1. Get the 48k Denoised Audio
+                    denoised_audio_48k = self.denoise_audio(complete_audio_float, sample_rate)
+                    
+                    # 2. Define Filenames
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    wav_temp_path = os.path.join(self.output_dir, f"temp_{timestamp}.wav")
+                    mp3_filename = f"rsr_tts_{timestamp}_denoised.mp3"
+                    mp3_filepath = os.path.join(self.output_dir, mp3_filename)
+                
+                    # 3. Save Temporary WAV (48k)
+                    # We must save as WAV first because 'soundfile' cannot write MP3s natively reliably
+                    sf.write(wav_temp_path, denoised_audio_48k, 48000)
+                
+                    # 4. Convert to MP3 256k using FFmpeg
+                    # -y: overwrite if exists
+                    # -b:a 256k: Bitrate 256kbps
+                    # -ar 48000: Keep sample rate 48kHz
+                    print(f"💾 Compressing to MP3 (256k)...")
+                    try:
+                        command = [
+                            "ffmpeg", "-i", wav_temp_path,
+                            "-acodec", "libmp3lame",
+                            "-b:a", "256k",
+                            "-ar", "48000",
+                            "-loglevel", "error",
+                            "-y",
+                            mp3_filepath
+                        ]
+                        subprocess.run(command, check=True)
+                        print(f"✅ Saved: {mp3_filepath}")
+                        
+                        # 5. Delete Temp WAV to save space
+                        os.remove(wav_temp_path)
+                        
+                        # Update logs
+                        final_log += f"✨ Denoising applied!\n💾 Saved: {mp3_filename} (48kHz/256k)\n"
+                
+                    except Exception as e:
+                        print(f"⚠️ FFmpeg failed: {e}. Keeping the WAV file.")
+                        final_log += f"⚠️ Saved as WAV (FFmpeg error): {wav_temp_path}\n"
+                else:
+                    final_log += "⚠️ DeepFilterNet not available. Returning raw audio.\n"
+                    final_log += "✨ Generation successful! Complete audio is ready."
+                
+                yield None, (sample_rate, final_audio_int16), final_log, gr.update(visible=False)
                 return
             
             if not has_received_chunks:
-                error_log = log + f"\n❌ Error: No audio chunks received. Time: {generation_time:.2f}s"
+                error_log = log + f"\n❌ Error: No audio chunks were received from the model. Generation time: {generation_time:.2f}s"
                 yield None, None, error_log, gr.update(visible=False)
                 return
 
-            if all_audio_chunks:
-                complete_audio = np.concatenate(all_audio_chunks)
-                final_duration = len(complete_audio) / sample_rate
-                final_log = log + f"⏱️ Completed in {generation_time:.2f}s\n🎵 Duration: {final_duration:.2f}s\n✨ Success!"
-                yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
-            else:
-                final_log = log + "❌ No audio was generated."
-                yield None, None, final_log, gr.update(visible=False)
-
         except gr.Error as e:
+            # Handle Gradio-specific errors (like input validation)
             self.is_generating = False
             self.current_streamer = None
             error_msg = f"❌ Input Error: {str(e)}"
@@ -822,7 +1017,7 @@ class RSRTTSDemo:
         except Exception as e:
             self.is_generating = False
             self.current_streamer = None
-            error_msg = f"❌ Error: {str(e)}"
+            error_msg = f"❌ An unexpected error occurred: {str(e)}"
             print(error_msg)
             import traceback
             traceback.print_exc()
@@ -882,16 +1077,20 @@ class RSRTTSDemo:
         examples_dir = os.path.join(os.path.dirname(__file__), "text_examples")
         self.example_scripts = []
         
+        # Check if text_examples directory exists
         if not os.path.exists(examples_dir):
             print(f"Warning: text_examples directory not found at {examples_dir}")
             return
         
+        # Get all .txt files in the text_examples directory
         txt_files = sorted([f for f in os.listdir(examples_dir) 
                           if f.lower().endswith('.txt') and os.path.isfile(os.path.join(examples_dir, f))])
         
         for txt_file in txt_files:
             file_path = os.path.join(examples_dir, txt_file)
+            
             import re
+            # Check if filename contains a time pattern like "45min", "90min", etc.
             time_pattern = re.search(r'(\d+)min', txt_file.lower())
             if time_pattern:
                 minutes = int(time_pattern.group(1))
@@ -903,12 +1102,16 @@ class RSRTTSDemo:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     script_content = f.read().strip()
                 
+                # Remove empty lines and lines with only whitespace
                 script_content = '\n'.join(line for line in script_content.split('\n') if line.strip())
                 
                 if not script_content:
                     continue
                 
+                # Parse the script to determine number of speakers
                 num_speakers = self._get_num_speakers_from_script(script_content)
+                
+                # Add to examples list as [num_speakers, script_content]
                 self.example_scripts.append([num_speakers, script_content])
                 print(f"Loaded example: {txt_file} with {num_speakers} speakers")
                 
@@ -924,31 +1127,40 @@ class RSRTTSDemo:
         """Determine the number of unique speakers in a script."""
         import re
         speakers = set()
+        
         lines = script.strip().split('\n')
         for line in lines:
+            # Use regex to find speaker patterns
             match = re.match(r'^Speaker\s+(\d+)\s*:', line.strip(), re.IGNORECASE)
             if match:
                 speaker_id = int(match.group(1))
                 speakers.add(speaker_id)
         
+        # If no speakers found, default to 1
         if not speakers:
             return 1
         
+        # Return the maximum speaker ID + 1 (assuming 0-based indexing)
+        # or the count of unique speakers if they're 1-based
         max_speaker = max(speakers)
         min_speaker = min(speakers)
         
         if min_speaker == 0:
             return max_speaker + 1
         else:
+            # Assume 1-based indexing, return the count
             return len(speakers)
     
     def get_saved_files(self) -> List[str]:
         """Get list of saved audio files sorted by creation time (newest first)."""
         if not os.path.exists(self.output_dir):
             return []
+            
         try:
+            # Get all wav and mp3 files
             files = [os.path.join(self.output_dir, f) for f in os.listdir(self.output_dir) 
-                    if f.lower().endswith('.wav')]
+                    if f.lower().endswith(('.wav', '.mp3'))]
+            # Sort by modification time, newest first
             files.sort(key=os.path.getmtime, reverse=True)
             return files
         except Exception as e:
@@ -1463,7 +1675,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 
                 # Complete audio output (non-streaming)
                 complete_audio_output = gr.Audio(
-                    label="Complete Audio (Download after generation)",
+                    label="Complete Audio (Denoised Output)",
                     type="numpy",
                     elem_classes="audio-output complete-audio-section",
                     streaming=False,  # Non-streaming mode
@@ -1474,7 +1686,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 
                 gr.Markdown("""
                 *💡 **Streaming**: Audio plays as it's being generated (may have slight pauses)  
-                *💡 **Complete Audio**: Will appear below after generation finishes*
+                *💡 **Complete Audio**: Final high-quality, denoised audio*
                 """)
                 
                 # Generation log
