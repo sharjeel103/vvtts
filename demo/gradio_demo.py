@@ -1,5 +1,7 @@
+%%writefile /kaggle/working/VibeVoice/demo/gradio_demo.py
 """
 RSR TTS - High-Quality Dialogue Generation Interface with Streaming Support
+Optimized for NVIDIA T4 (4-bit NF4 Quantization) & Dual GPU Setups
 """
 
 import argparse
@@ -24,10 +26,14 @@ import pyrubberband as pyrb
 import types
 import gc
 from tqdm import tqdm
-import subprocess  
+import subprocess
 import math
+import uuid
+import re
 
+# Transformers & Model Imports
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+from transformers import BitsAndBytesConfig
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference, VibeVoiceGenerationOutput, VibeVoiceTokenConstraintProcessor
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -43,1970 +49,714 @@ from df.io import load_audio
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
+# --- GLOBAL BACKGROUND JOB STORAGE ---
+BACKGROUND_JOBS = {}
 
 class RSRTTSDemo:
-    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, auto_device_map: bool = False):
-        """Initialize the RSR TTS demo with model loading."""
+    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 15, auto_device_map: bool = False, t4_mode: bool = False):
         self.model_path = model_path
-        self.device = "cuda" # Enforce CUDA for T4 setup
+        self.device = "cuda" 
         self.inference_steps = inference_steps
         self.auto_device_map = auto_device_map
-        self.is_generating = False  # Track generation state
-        self.stop_generation = False  # Flag to stop generation
-        self.current_streamer = None  # Track current audio streamer
+        self.t4_mode = t4_mode 
+        self.is_generating = False 
         
-        # Initialize DeepFilterNet (Always On)
+        # --- THREAD SAFETY ---
+        self.gpu_lock = threading.Lock() # Prevents concurrent GPU access
+        self.active_live_stop_event = None # Specific stop signal for the Live tab
+        self.current_streamer = None 
+        
+        torch.backends.cudnn.benchmark = False 
+        
         print("🎙️ Initializing DeepFilterNet for mandatory denoising...")
-        # init_df() returns model, df_state, encoded_df_state (if any)
         self.df_model, self.df_state, _ = init_df()
 
-        # Performance tuning
-        torch.backends.cudnn.benchmark = True
-        
-        # Ensure output directory exists immediately
         self.output_dir = "saved_outputs"
         os.makedirs(self.output_dir, exist_ok=True)
         
         self.load_model()
         self.setup_voice_presets()
-        self.load_example_scripts()  # Load example scripts
+        self.load_example_scripts()
         
     def load_model(self):
-        """Load the TTS model and processor."""
         print(f"Loading processor & model from {self.model_path}")
-        print(f"Using device: {self.device} (Dual T4 Optimized)")
-        
-        # Load processor
         self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
         
-        # --- T4 SPECIFIC CONFIGURATION ---
         load_dtype = torch.float16
         attn_impl_primary = "sdpa" 
-            
-        print(f"Configured: torch_dtype={load_dtype}, attn_implementation={attn_impl_primary}")
-
         load_kwargs = {
             "torch_dtype": load_dtype,
             "attn_implementation": attn_impl_primary,
         }
 
-        # --- DUAL T4 MANUAL SPLIT STRATEGY ---
-        if self.auto_device_map:
-            if torch.cuda.device_count() >= 2:
-                print("⚡ Dual GPU detected. Constructing RE-BALANCED manual split map...")
-                device_map = {}
-                
-                # OPTIMIZED BALANCE: Split at Layer 18
-                # GPU 0: Embeddings + 18 Layers
-                device_map["model.language_model.embed_tokens"] = 0
-                for i in range(18): 
-                    device_map[f"model.language_model.layers.{i}"] = 0
-                
-                # GPU 1: 10 Layers + Heads + Overhead
-                for i in range(18, 28): 
-                    device_map[f"model.language_model.layers.{i}"] = 1
-                
-                device_map["model.language_model.norm"] = 1
-                device_map["lm_head"] = 1
-                
-                # Custom Components on GPU 1
-                device_map["model.prediction_head"] = 1
-                device_map["model.acoustic_tokenizer"] = 1
-                device_map["model.semantic_tokenizer"] = 1
-                device_map["model.acoustic_connector"] = 1
-                device_map["model.semantic_connector"] = 1
-                device_map["model.speech_bias_factor"] = 1
-                device_map["model.speech_scaling_factor"] = 1
-                
-                print(f"🗺️  Using Explicit Device Map: Optimized Split at Layer 18")
-                load_kwargs["device_map"] = device_map
-            else:
-                print("⚡ Single GPU or non-standard setup. Using 'auto'.")
-                load_kwargs["device_map"] = "auto"
+        if self.t4_mode:
+            print("🟢 T4 Optimization Enabled: Loading with 4-bit NF4 Quantization...")
+            try:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    load_in_8bit=False,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    llm_int8_skip_modules=["prediction_head", "acoustic_connector", "semantic_connector", "acoustic_tokenizer", "semantic_tokenizer"]
+                )
+                load_kwargs["quantization_config"] = bnb_config
+                load_kwargs["device_map"] = {"": 0} 
+            except ImportError:
+                raise ImportError("bitsandbytes not installed")
+
+        elif self.auto_device_map and torch.cuda.device_count() >= 2:
+            print("⚡ Dual GPU detected. Using Manual Split...")
+            device_map = {}
+            device_map["model.language_model.embed_tokens"] = 0
+            for i in range(18): device_map[f"model.language_model.layers.{i}"] = 0
+            for i in range(18, 28): device_map[f"model.language_model.layers.{i}"] = 1
+            device_map["model.language_model.norm"] = 1
+            device_map["lm_head"] = 1
+            device_map["model.prediction_head"] = 1
+            device_map["model.acoustic_tokenizer"] = 1
+            device_map["model.semantic_tokenizer"] = 1
+            device_map["model.acoustic_connector"] = 1
+            device_map["model.semantic_connector"] = 1
+            device_map["model.speech_bias_factor"] = 1
+            device_map["model.speech_scaling_factor"] = 1
+            load_kwargs["device_map"] = device_map
+        else:
+            load_kwargs["device_map"] = "auto"
         
-        # Load model
         try:
-            print(f"Loading model with kwargs: {load_kwargs}")
+            self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(self.model_path, **load_kwargs)
+            self._apply_patches()
+            self.model.eval()
+            print("✅ Model loaded successfully.")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            raise e
+
+    def _apply_patches(self):
+        # --- Patch 1: _process_speech_inputs ---
+        def patched_process_speech_inputs(self, speech_tensors, speech_masks, speech_type="audio"):
+            with torch.no_grad():
+                try: target_device = self.model.get_input_embeddings().weight.device
+                except: target_device = self.model.device
+
+                if speech_type == "audio":
+                    tokenizer_device = self.model.acoustic_tokenizer.device
+                    speech_tensors = speech_tensors.to(tokenizer_device)
+                    encoder_output = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))
+                    acoustic_latents = encoder_output.sample(dist_type=self.model.acoustic_tokenizer.std_dist_type)[0]
+                    scale = self.model.speech_scaling_factor.to(acoustic_latents.device)
+                    bias = self.model.speech_bias_factor.to(acoustic_latents.device)
+                    acoustic_features = (acoustic_latents + bias) * scale
+                    connector_device = self.model.acoustic_connector.fc1.weight.device
+                    speech_masks_device = speech_masks.to(connector_device)
+                    acoustic_connected = self.model.acoustic_connector(acoustic_features.to(connector_device))[speech_masks_device]
+                    return acoustic_features, acoustic_connected.to(target_device)
+                else:
+                      return self._original_process_speech_inputs(speech_tensors, speech_masks, speech_type)
+
+        self.model._original_process_speech_inputs = self.model._process_speech_inputs
+        self.model._process_speech_inputs = types.MethodType(patched_process_speech_inputs, self.model)
+
+        # --- Patch 2: generate ---
+        def patched_generate(
+            self, inputs: Optional[torch.Tensor] = None, generation_config: Optional[GenerationConfig] = None,
+            logits_processor: Optional[LogitsProcessorList] = None, stopping_criteria: Optional[StoppingCriteriaList] = None,
+            prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None, synced_gpus: Optional[bool] = None,
+            assistant_model: Optional["PreTrainedModel"] = None, audio_streamer: Optional[Union[AudioStreamer, Any]] = None, 
+            negative_prompt_ids: Optional[torch.Tensor] = None, negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+            speech_tensors: Optional[torch.FloatTensor] = None, speech_masks: Optional[torch.BoolTensor] = None,
+            speech_input_mask: Optional[torch.BoolTensor] = None, return_speech: bool = True, cfg_scale: float = 1.7,
+            stop_check_fn: Optional[Callable[[], bool]] = None, **kwargs,
+        ) -> Union[torch.LongTensor, VibeVoiceGenerationOutput]:
             
-            self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-                self.model_path,
-                **load_kwargs
+            tokenizer = kwargs.pop("tokenizer", None)
+            parsed_scripts = kwargs.pop("parsed_scripts", None)
+            all_speakers_list = kwargs.pop("all_speakers_list", None)
+            max_length_times = kwargs.pop("max_length_times", 2)
+
+            if kwargs.get('max_new_tokens', None) is None:
+                kwargs['max_new_tokens'] = self.config.decoder_config.max_position_embeddings - kwargs['input_ids'].shape[-1]
+
+            generation_config, model_kwargs, input_ids, logits_processor, stopping_criteria = self._build_generate_config_model_kwargs(
+                generation_config, inputs, tokenizer, return_processors=True, **kwargs
             )
             
-            # --- PATCH 1: _process_speech_inputs (Prefill Stage) ---
-            def patched_process_speech_inputs(self, speech_tensors, speech_masks, speech_type="audio"):
-                """Patched version to ensure device compatibility."""
-                with torch.no_grad():
-                    # Determine target device from model's input embeddings
-                    try:
-                        target_device = self.model.get_input_embeddings().weight.device
-                    except:
-                        target_device = self.device
+            negative_kwargs = {
+                'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
+                'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
+                'max_new_tokens': kwargs.get('max_new_tokens', 100) 
+            }
+            negative_generation_config, negative_model_kwargs, negative_input_ids = self._build_generate_config_model_kwargs(
+                None, None, tokenizer, return_processors=False, **negative_kwargs
+            )
 
-                    if speech_type == "audio":
-                        tokenizer_device = self.model.acoustic_tokenizer.device
-                        speech_tensors = speech_tensors.to(tokenizer_device)
-                        
-                        encoder_output = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))
-                        acoustic_latents = encoder_output.sample(dist_type=self.model.acoustic_tokenizer.std_dist_type)[0]
-                        
-                        acoustic_features = (acoustic_latents + self.model.speech_bias_factor.to(acoustic_latents.device)) * self.model.speech_scaling_factor.to(acoustic_latents.device)
-                        
-                        connector_device = self.model.acoustic_connector.fc1.weight.device
-                        speech_masks_device = speech_masks.to(connector_device)
-                        
-                        acoustic_connected = self.model.acoustic_connector(acoustic_features.to(connector_device))[speech_masks_device]
-                        
-                        # MOVE TO TARGET DEVICE
-                        return acoustic_features, acoustic_connected.to(target_device)
-                    else:
-                         return self._original_process_speech_inputs(speech_tensors, speech_masks, speech_type)
+            acoustic_cache = VibeVoiceTokenizerStreamingCache()
+            semantic_cache = VibeVoiceTokenizerStreamingCache()
+            
+            batch_size = input_ids.shape[0]
+            device = input_ids.device
+            finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            correct_cnt = torch.zeros(batch_size, dtype=torch.long, device=device)
+            is_prefill = True
+            inputs_embeds = None
+            audio_chunks = [[] for _ in range(batch_size)]
+            initial_length = input_ids.shape[-1]
+            initial_length_per_sample = model_kwargs['attention_mask'].sum(dim=-1)
 
-            self.model._original_process_speech_inputs = self.model._process_speech_inputs
-            self.model._process_speech_inputs = types.MethodType(patched_process_speech_inputs, self.model)
-            print("✅ Applied device-alignment patch to _process_speech_inputs")
+            valid_tokens = [generation_config.speech_start_id, generation_config.speech_end_id, generation_config.speech_diffusion_id, generation_config.eos_token_id]
+            if hasattr(generation_config, 'bos_token_id') and generation_config.bos_token_id is not None: valid_tokens.append(generation_config.bos_token_id)
+            
+            token_constraint_processor = VibeVoiceTokenConstraintProcessor(valid_tokens, device=device)
+            if logits_processor is None: logits_processor = LogitsProcessorList()
+            logits_processor.append(token_constraint_processor)
+            
+            max_steps = min(generation_config.max_length - initial_length, int(max_length_times * initial_length))
+            max_step_per_sample = torch.min(generation_config.max_length - initial_length_per_sample, (max_length_times * initial_length_per_sample).long())
+            reach_max_step_sample = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-            # --- PATCH 2: generate (Autoregressive Stage) ---
-            def patched_generate(
-                self,
-                inputs: Optional[torch.Tensor] = None,
-                generation_config: Optional[GenerationConfig] = None,
-                logits_processor: Optional[LogitsProcessorList] = None,
-                stopping_criteria: Optional[StoppingCriteriaList] = None,
-                prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-                synced_gpus: Optional[bool] = None,
-                assistant_model: Optional["PreTrainedModel"] = None,
-                audio_streamer: Optional[Union[AudioStreamer, Any]] = None, 
-                negative_prompt_ids: Optional[torch.Tensor] = None,
-                negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-                speech_tensors: Optional[torch.FloatTensor] = None,
-                speech_masks: Optional[torch.BoolTensor] = None,
-                speech_input_mask: Optional[torch.BoolTensor] = None,
-                return_speech: bool = True,
-                cfg_scale: float = 1.0,
-                stop_check_fn: Optional[Callable[[], bool]] = None,
-                **kwargs,
-            ) -> Union[torch.LongTensor, VibeVoiceGenerationOutput]:
+            progress_bar = tqdm(range(max_steps), desc="Generating", leave=False) if kwargs.get("show_progress_bar", True) else range(max_steps)
+            
+            for step in progress_bar:
+                # --- CHECK STOP SIGNAL (Unique per job) ---
+                if stop_check_fn is not None and stop_check_fn():
+                    if audio_streamer is not None: audio_streamer.end()
+                    break
                 
-                # --- START ORIGINAL GENERATE LOGIC COPY ---
-                tokenizer = kwargs.pop("tokenizer", None)
-                parsed_scripts = kwargs.pop("parsed_scripts", None)
-                all_speakers_list = kwargs.pop("all_speakers_list", None)
-                max_length_times = kwargs.pop("max_length_times", 2)
-
-                if kwargs.get('max_new_tokens', None) is None:
-                    kwargs['max_new_tokens'] = self.config.decoder_config.max_position_embeddings - kwargs['input_ids'].shape[-1]
-
-                generation_config, model_kwargs, input_ids, logits_processor, stopping_criteria = self._build_generate_config_model_kwargs(
-                    generation_config, inputs, tokenizer, return_processors=True, **kwargs
-                )
+                if audio_streamer is not None and hasattr(audio_streamer, 'finished_flags'):
+                    if any(audio_streamer.finished_flags): break
                 
-                negative_kwargs = {
-                    'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
-                    'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
-                    'max_new_tokens': kwargs.get('max_new_tokens', 100) 
-                }
-                negative_generation_config, negative_model_kwargs, negative_input_ids = self._build_generate_config_model_kwargs(
-                    None, None, tokenizer, return_processors=False, **negative_kwargs
-                )
+                if finished_tags.all(): break
 
-                acoustic_cache = VibeVoiceTokenizerStreamingCache()
-                semantic_cache = VibeVoiceTokenizerStreamingCache()
+                if input_ids.shape[-1] >= generation_config.max_length:
+                    reached_samples = torch.arange(batch_size, device=device)[~finished_tags]
+                    if reached_samples.numel() > 0: reach_max_step_sample[reached_samples] = True
+                    break
                 
-                batch_size = input_ids.shape[0]
-                device = input_ids.device
-                finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                correct_cnt = torch.zeros(batch_size, dtype=torch.long, device=device)
-                is_prefill = True
-                inputs_embeds = None
-                verbose = kwargs.get("verbose", False)
-
-                audio_chunks = [[] for _ in range(batch_size)]
-
-                initial_length = input_ids.shape[-1]
-                initial_length_per_sample = model_kwargs['attention_mask'].sum(dim=-1)
-
-                valid_tokens = [
-                    generation_config.speech_start_id,
-                    generation_config.speech_end_id, 
-                    generation_config.speech_diffusion_id,
-                    generation_config.eos_token_id
-                ]
-                if hasattr(generation_config, 'bos_token_id') and generation_config.bos_token_id is not None:
-                    valid_tokens.append(generation_config.bos_token_id)
-                
-                token_constraint_processor = VibeVoiceTokenConstraintProcessor(valid_tokens, device=device)
-                if logits_processor is None:
-                    logits_processor = LogitsProcessorList()
-                logits_processor.append(token_constraint_processor)
-                
-                max_steps = min(generation_config.max_length - initial_length, int(max_length_times * initial_length))
-                max_step_per_sample = torch.min(generation_config.max_length - initial_length_per_sample, (max_length_times * initial_length_per_sample).long())
-                reach_max_step_sample = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-                if kwargs.get("show_progress_bar", True):
-                    progress_bar = tqdm(range(max_steps), desc="Generating", leave=False)
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                if is_prefill:
+                    prefill_inputs = {"speech_tensors": speech_tensors.to(device=device), "speech_masks": speech_masks.to(device), "speech_input_mask": speech_input_mask.to(device)}
+                    is_prefill = False
                 else:
-                    progress_bar = range(max_steps)
+                    _ = model_inputs.pop('inputs_embeds', None)
+                    prefill_inputs = {'inputs_embeds': inputs_embeds}
+
+                outputs = self(**model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False)
+                model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder=False)
+
+                next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+                next_token_scores = logits_processor(input_ids, next_token_logits)
                 
-                for step in progress_bar:
-                    if stop_check_fn is not None and stop_check_fn():
-                        if audio_streamer is not None:
-                            audio_streamer.end()
-                        break
-                    
-                    if audio_streamer is not None and hasattr(audio_streamer, 'finished_flags'):
-                        if any(audio_streamer.finished_flags):
-                            break
-                    
-                    if finished_tags.all():
-                        break
+                if generation_config.do_sample:
+                    probs = nn.functional.softmax(next_token_scores, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-                    if input_ids.shape[-1] >= generation_config.max_length:
-                        reached_samples = torch.arange(batch_size, device=device)[~finished_tags]
-                        if reached_samples.numel() > 0:
-                            reach_max_step_sample[reached_samples] = True
-                        break
-                    
-                    model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                    if is_prefill:
-                        prefill_inputs = {
-                            "speech_tensors": speech_tensors.to(device=device),
-                            "speech_masks": speech_masks.to(device),
-                            "speech_input_mask": speech_input_mask.to(device),
-                        }
-                        is_prefill = False
-                    else:
-                        _ = model_inputs.pop('inputs_embeds', None)
-                        prefill_inputs = {'inputs_embeds': inputs_embeds}
+                next_tokens[finished_tags] = generation_config.eos_token_id
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                
+                if not kwargs.get('refresh_negative', True):
+                    negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
+                    if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
+                        negative_model_inputs['inputs_embeds'] = inputs_embeds
+                        negative_model_inputs['input_ids'] = None
+                    negative_outputs = self(**negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False)
+                    negative_model_kwargs = self._update_model_kwargs_for_generation(negative_outputs, negative_model_kwargs, is_encoder_decoder=False)
+                    negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
 
-                    outputs = self(
-                        **model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False,
-                    )
-                    model_kwargs = self._update_model_kwargs_for_generation(
-                        outputs, model_kwargs, is_encoder_decoder=False,
-                    )
+                if (next_tokens == generation_config.eos_token_id).any():
+                    eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
+                    new_eos_indices = eos_indices[~finished_tags[eos_indices]]
+                    if new_eos_indices.numel() > 0:
+                        finished_tags[new_eos_indices] = True
+                        if audio_streamer is not None: audio_streamer.end(new_eos_indices)
 
-                    next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-                    next_token_scores = logits_processor(input_ids, next_token_logits)
-                    
-                    if generation_config.do_sample:
-                        probs = nn.functional.softmax(next_token_scores, dim=-1)
-                        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                    else:
-                        next_tokens = torch.argmax(next_token_scores, dim=-1)
+                max_length_reached = step >= max_step_per_sample
+                new_max_length_indices = torch.nonzero(max_length_reached & ~finished_tags, as_tuple=False).squeeze(1)
+                if new_max_length_indices.numel() > 0:
+                    finished_tags[new_max_length_indices] = True
+                    reach_max_step_sample[new_max_length_indices] = True
+                    if audio_streamer is not None: audio_streamer.end(new_max_length_indices)
 
-                    next_tokens[finished_tags] = generation_config.eos_token_id
-                    input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-                    
-                    if not kwargs.get('refresh_negative', True):
+                diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
+                if diffusion_end_indices.numel() > 0:
+                    acoustic_cache.set_to_zero(diffusion_end_indices)
+                    semantic_cache.set_to_zero(diffusion_end_indices)
+                
+                diffusion_start_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_start_id)]
+                if diffusion_start_indices.numel() > 0 and kwargs.get('refresh_negative', True):
+                    for i, sample_idx in enumerate(diffusion_start_indices.tolist()):
+                        negative_model_kwargs['attention_mask'][sample_idx, :] = 0
+                        negative_model_kwargs['attention_mask'][sample_idx, -1] = 1
+                    for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, negative_model_kwargs['past_key_values'].value_cache)):
+                        for sample_idx in diffusion_start_indices.tolist():
+                            k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
+                            v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+                    for sample_idx in diffusion_start_indices.tolist():
+                        negative_input_ids[sample_idx, -1] = generation_config.speech_start_id
+                
+                next_inputs_embeds = self.model.get_input_embeddings()(next_tokens).unsqueeze(1)
+                diffusion_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_diffusion_id)]
+                
+                if diffusion_indices.numel() > 0:
+                    if kwargs.get('refresh_negative', True):
                         negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
                         if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
                             negative_model_inputs['inputs_embeds'] = inputs_embeds
                             negative_model_inputs['input_ids'] = None
-
-                        negative_outputs = self(
-                            **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
-                        )
-                        negative_model_kwargs = self._update_model_kwargs_for_generation(
-                            negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
-                        )
+                        negative_outputs = self(**negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False)
+                        negative_model_kwargs = self._update_model_kwargs_for_generation(negative_outputs, negative_model_kwargs, is_encoder_decoder=False)
                         negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
-
-                    if (next_tokens == generation_config.eos_token_id).any():
-                        eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
-                        new_eos_indices = eos_indices[~finished_tags[eos_indices]]
-                        if new_eos_indices.numel() > 0:
-                            finished_tags[new_eos_indices] = True
-                            if audio_streamer is not None:
-                                audio_streamer.end(new_eos_indices)
-
-                    max_length_reached = step >= max_step_per_sample
-                    new_max_length_indices = torch.nonzero(max_length_reached & ~finished_tags, as_tuple=False).squeeze(1)
-                    if new_max_length_indices.numel() > 0:
-                        finished_tags[new_max_length_indices] = True
-                        reach_max_step_sample[new_max_length_indices] = True
-                        if audio_streamer is not None:
-                            audio_streamer.end(new_max_length_indices)
-
-                    diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
-                    if diffusion_end_indices.numel() > 0:
-                        acoustic_cache.set_to_zero(diffusion_end_indices)
-                        semantic_cache.set_to_zero(diffusion_end_indices)
                     
-                    diffusion_start_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_start_id)]
-                    if diffusion_start_indices.numel() > 0 and kwargs.get('refresh_negative', True):
-                        for i, sample_idx in enumerate(diffusion_start_indices.tolist()):
-                            negative_model_kwargs['attention_mask'][sample_idx, :] = 0
-                            negative_model_kwargs['attention_mask'][sample_idx, -1] = 1
-                        for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, 
-                                                                                negative_model_kwargs['past_key_values'].value_cache)):
-                            for sample_idx in diffusion_start_indices.tolist():
-                                k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
-                                v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
-                        for sample_idx in diffusion_start_indices.tolist():
-                            negative_input_ids[sample_idx, -1] = generation_config.speech_start_id
-                    
-                    next_inputs_embeds = self.model.get_input_embeddings()(next_tokens).unsqueeze(1)
-                    
-                    diffusion_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_diffusion_id)]
-                    
-                    if diffusion_indices.numel() > 0:
-                        if kwargs.get('refresh_negative', True):
-                            negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
-                            if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
-                                negative_model_inputs['inputs_embeds'] = inputs_embeds
-                                negative_model_inputs['input_ids'] = None
-
-                            negative_outputs = self(
-                                **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
-                            )
-                            negative_model_kwargs = self._update_model_kwargs_for_generation(
-                                negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
-                            )
-                            negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
-                        
-                        non_diffusion_mask = ~finished_tags & (next_tokens != generation_config.speech_diffusion_id)
-                        if non_diffusion_mask.any():
-                            non_diffusion_indices = torch.arange(batch_size, device=device)[non_diffusion_mask]
-                            start_indices = correct_cnt[non_diffusion_indices]
-
-                            seq_len = negative_model_kwargs['attention_mask'].shape[1]
-                            for i, (sample_idx, start_idx) in enumerate(zip(non_diffusion_indices.tolist(), start_indices.tolist())):
-                                if start_idx + 1 < seq_len - 1:
-                                    negative_model_kwargs['attention_mask'][sample_idx, start_idx+1:] = \
-                                        negative_model_kwargs['attention_mask'][sample_idx, start_idx:-1].clone()
-                                negative_model_kwargs['attention_mask'][sample_idx, start_idx] = 0
-
-                            for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, 
-                                                                                negative_model_kwargs['past_key_values'].value_cache)):
-                                for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
-                                    if start_idx + 1 < k_cache.shape[2] - 1:
-                                        k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
-                                        v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
-                            
+                    non_diffusion_mask = ~finished_tags & (next_tokens != generation_config.speech_diffusion_id)
+                    if non_diffusion_mask.any():
+                        non_diffusion_indices = torch.arange(batch_size, device=device)[non_diffusion_mask]
+                        start_indices = correct_cnt[non_diffusion_indices]
+                        seq_len = negative_model_kwargs['attention_mask'].shape[1]
+                        for i, (sample_idx, start_idx) in enumerate(zip(non_diffusion_indices.tolist(), start_indices.tolist())):
+                            if start_idx + 1 < seq_len - 1:
+                                negative_model_kwargs['attention_mask'][sample_idx, start_idx+1:] = negative_model_kwargs['attention_mask'][sample_idx, start_idx:-1].clone()
+                            negative_model_kwargs['attention_mask'][sample_idx, start_idx] = 0
+                        for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, negative_model_kwargs['past_key_values'].value_cache)):
                             for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
-                                if start_idx + 1 < negative_input_ids.shape[1] - 1:
-                                    negative_input_ids[sample_idx, start_idx+1:] = \
-                                        negative_input_ids[sample_idx, start_idx:-1].clone()
-                                        
-                            correct_cnt[non_diffusion_indices] += 1
+                                if start_idx + 1 < k_cache.shape[2] - 1:
+                                    k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
+                                    v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
+                        for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
+                            if start_idx + 1 < negative_input_ids.shape[1] - 1:
+                                negative_input_ids[sample_idx, start_idx+1:] = negative_input_ids[sample_idx, start_idx:-1].clone()
+                        correct_cnt[non_diffusion_indices] += 1
 
-                        positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
-                        negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
-                        
-                        speech_latent = self.sample_speech_tokens(
-                            positive_condition,
-                            negative_condition,
-                            cfg_scale=cfg_scale,
-                        ).unsqueeze(1)
-                                        
-                        scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
-                        audio_chunk = self.model.acoustic_tokenizer.decode(
-                            scaled_latent.to(self.model.acoustic_tokenizer.device),
-                            cache=acoustic_cache,
-                            sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
-                            use_cache=True,
-                            debug=False
-                        )
-                        
-                        for i, sample_idx in enumerate(diffusion_indices):
-                            idx = sample_idx.item()
-                            if not finished_tags[idx]:
-                                audio_chunks[idx].append(audio_chunk[i])
-
-                        if audio_streamer is not None:
-                            audio_streamer.put(audio_chunk, diffusion_indices)
-                            
-                        semantic_features = self.model.semantic_tokenizer.encode(
-                            audio_chunk,
-                            cache=semantic_cache,
-                            sample_indices=diffusion_indices,
-                            use_cache=True,
-                            debug=False
-                        ).mean
-                        
-                        acoustic_embed = self.model.acoustic_connector(speech_latent)
-                        semantic_embed = self.model.semantic_connector(semantic_features)
-                        diffusion_embeds = acoustic_embed + semantic_embed
-
-                        # === CRITICAL FIX: Ensure diffusion_embeds is on the same device as next_inputs_embeds ===
-                        target_device_for_embeds = next_inputs_embeds.device
-                        next_inputs_embeds[diffusion_indices] = diffusion_embeds.to(target_device_for_embeds)
+                    positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
+                    negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
                     
-                    inputs_embeds = next_inputs_embeds
+                    speech_latent = self.sample_speech_tokens(positive_condition, negative_condition, cfg_scale=cfg_scale).unsqueeze(1)
+                    scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
+                    audio_chunk = self.model.acoustic_tokenizer.decode(
+                        scaled_latent.to(self.model.acoustic_tokenizer.device), cache=acoustic_cache, sample_indices=diffusion_indices.to(self.model.acoustic_tokenizer.device),
+                        use_cache=True, debug=False
+                    )
+                    
+                    for i, sample_idx in enumerate(diffusion_indices):
+                        idx = sample_idx.item()
+                        if not finished_tags[idx]: audio_chunks[idx].append(audio_chunk[i])
 
-                if audio_streamer is not None:
-                    audio_streamer.end()
-
-                final_audio_outputs = []
-                for sample_chunks in audio_chunks:
-                    if sample_chunks:
-                        concatenated_audio = torch.cat(sample_chunks, dim=-1)
-                        final_audio_outputs.append(concatenated_audio)
-                    else:
-                        final_audio_outputs.append(None)
-
-                return VibeVoiceGenerationOutput(
-                    sequences=input_ids,
-                    speech_outputs=final_audio_outputs if return_speech else None,
-                    reach_max_step_sample=reach_max_step_sample,
-                )
-                # --- END ORIGINAL GENERATE LOGIC COPY ---
-
-            # Apply the patch to the instance
-            self.model.generate = types.MethodType(patched_generate, self.model)
-            print("✅ Applied device-alignment patch to generate()")
-
-            # Ensure model is in evaluation mode
-            self.model.eval()
-            print("✅ Model loaded successfully.")
+                    if audio_streamer is not None: audio_streamer.put(audio_chunk, diffusion_indices)
+                        
+                    semantic_features = self.model.semantic_tokenizer.encode(audio_chunk, cache=semantic_cache, sample_indices=diffusion_indices, use_cache=True, debug=False).mean
+                    acoustic_embed = self.model.acoustic_connector(speech_latent)
+                    semantic_embed = self.model.semantic_connector(semantic_features)
+                    diffusion_embeds = acoustic_embed + semantic_embed
+                    target_device_for_embeds = next_inputs_embeds.device
+                    next_inputs_embeds[diffusion_indices] = diffusion_embeds.to(target_device_for_embeds)
                 
-        except Exception as e:
-            print(f"[ERROR] Loading failed: {e}")
-            print(traceback.format_exc())
-            raise e
+                inputs_embeds = next_inputs_embeds
+
+            if audio_streamer is not None: audio_streamer.end()
+
+            final_audio_outputs = [torch.cat(c, dim=-1) if c else None for c in audio_chunks]
+
+            return VibeVoiceGenerationOutput(
+                sequences=input_ids, speech_outputs=final_audio_outputs if return_speech else None, reach_max_step_sample=reach_max_step_sample,
+            )
+
+        self.model.generate = types.MethodType(patched_generate, self.model)
         
-        # Configure Scheduler
         if hasattr(self.model, "model") and hasattr(self.model.model, "noise_scheduler"):
             try:
                 self.model.model.noise_scheduler = self.model.model.noise_scheduler.from_config(
-                    self.model.model.noise_scheduler.config, 
-                    algorithm_type='sde-dpmsolver++',
-                    beta_schedule='squaredcos_cap_v2'
+                    self.model.model.noise_scheduler.config, algorithm_type='sde-dpmsolver++', beta_schedule='squaredcos_cap_v2'
                 )
                 self.model.set_ddpm_inference_steps(num_steps=self.inference_steps)
             except Exception as e:
                 print(f"Warning: Could not configure noise scheduler: {e}")
-    
+
+    # --- Utility Functions ---
     def setup_voice_presets(self):
-        """Setup voice presets by scanning the voices directory."""
         voices_dir = os.path.join(os.path.dirname(__file__), "voices")
-        
-        # Check if voices directory exists
         if not os.path.exists(voices_dir):
-            print(f"Warning: Voices directory not found at {voices_dir}")
             self.voice_presets = {}
             self.available_voices = {}
             return
         
-        # Scan for all WAV files in the voices directory
-        self.voice_presets = {}
-        
-        # Get all .wav files in the voices directory
-        wav_files = [f for f in os.listdir(voices_dir) 
-                    if f.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac')) and os.path.isfile(os.path.join(voices_dir, f))]
-        
-        # Create dictionary with filename (without extension) as key
-        for wav_file in wav_files:
-            # Remove .wav extension to get the name
-            name = os.path.splitext(wav_file)[0]
-            # Create full path
-            full_path = os.path.join(voices_dir, wav_file)
-            self.voice_presets[name] = full_path
-        
-        # Sort the voice presets alphabetically by name for better UI
-        self.voice_presets = dict(sorted(self.voice_presets.items()))
-        
-        # Filter out voices that don't exist
-        self.available_voices = {
-            name: path for name, path in self.voice_presets.items()
-            if os.path.exists(path)
-        }
-        
-        if not self.available_voices:
-            print("Warning: No voice presets found in demo/voices directory.")
-        
-        print(f"Found {len(self.available_voices)} voice files in {voices_dir}")
-        print(f"Available voices: {', '.join(self.available_voices.keys())}")
+        wav_files = [f for f in os.listdir(voices_dir) if f.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac'))]
+        self.voice_presets = {os.path.splitext(f)[0]: os.path.join(voices_dir, f) for f in wav_files}
+        self.available_voices = dict(sorted(self.voice_presets.items()))
     
     def read_audio(self, audio_path: str, target_sr: int = 24000) -> np.ndarray:
-        """Read and preprocess audio file."""
         try:
             wav, sr = sf.read(audio_path)
-            if len(wav.shape) > 1:
-                wav = np.mean(wav, axis=1)
-            if sr != target_sr:
-                wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
+            if len(wav.shape) > 1: wav = np.mean(wav, axis=1)
+            if sr != target_sr: wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
             return wav
-        except Exception as e:
-            print(f"Error reading audio {audio_path}: {e}")
-            return np.array([])
+        except: return np.array([])
 
     def _adjust_voice_speed(self, audio_np: np.ndarray, speed_factor: float, sample_rate: int = 24000) -> np.ndarray:
-        """Adjust voice speed using time-stretching without changing pitch.
-
-        Args:
-            audio_np: Input audio array (float32).
-            speed_factor: Speed adjustment (0.8 = slower, 1.2 = faster).
-            sample_rate: The sample rate of the audio.
-
-        Returns:
-            Speed-adjusted audio array.
-        """
-        if speed_factor == 1.0:
-            return audio_np  # No change needed
-        
-        # Use pyrubberband for high-quality, pitch-invariant speed change
-        try:
-            # 2. Use pyrb.time_stretch instead of librosa
-            adjusted_audio = pyrb.time_stretch(y=audio_np, sr=sample_rate, rate=speed_factor)
-            
-            original_length = len(audio_np)
-            target_length = len(adjusted_audio)
-            logger.info(f"Adjusted voice speed by factor {speed_factor:.2f} ({original_length} -> {target_length} samples)")
-            
-            return adjusted_audio
-        except Exception as e:
-            logger.error(f"Error during voice speed adjustment: {e}. Returning original audio.")
-            return audio_np
+        if speed_factor == 1.0: return audio_np
+        try: return pyrb.time_stretch(y=audio_np, sr=sample_rate, rate=speed_factor)
+        except: return audio_np
     
-    # --- DeepFilterNet Denoising Helper ---
     def denoise_audio(self, audio_np, sample_rate: int = 24000):
-            """
-            Denoise audio using DeepFilterNet.
-            FIX: Keeps input on CPU because df.enhance() requires CPU tensors for feature extraction.
-            """
-            if not self.df_model:
-                return audio_np
-    
-            try:
-                print("🧹 Denoising audio with DeepFilterNet...")
-    
-                # --- SAFETY CHECK 1: Force Input to CPU Numpy ---
-                if torch.is_tensor(audio_np):
-                    audio_np = audio_np.detach().cpu().numpy()
-                
-                audio_np = audio_np.astype(np.float32)
-    
-                # 1. Resample to 48k
-                target_sr = 48000
-                if sample_rate != target_sr:
-                    audio_48k = librosa.resample(audio_np, orig_sr=sample_rate, target_sr=target_sr)
-                else:
-                    audio_48k = audio_np
-    
-                # 2. Setup Chunking
-                total_samples = len(audio_48k)
-                duration_min = total_samples / target_sr / 60
-                MAX_CHUNK_MIN = 7
-                num_parts = math.ceil(duration_min / MAX_CHUNK_MIN)
-                
-                if num_parts <= 1:
-                    chunk_size = total_samples
-                else:
-                    chunk_size = math.ceil(total_samples / num_parts)
-    
-                print(f"   ↳ Audio is {duration_min:.2f} mins. Splitting into {num_parts} parts.")
-    
-                # 3. Process Parts
-                enhanced_parts = []
-                OVERLAP_SEC = 2
-                overlap_samples = int(OVERLAP_SEC * target_sr)
-    
-                for i in range(num_parts):
-                    start = i * chunk_size
-                    end = min(start + chunk_size, total_samples)
-                    pad_left = overlap_samples if i > 0 else 0
-                    input_start = start - pad_left
-                    
-                    chunk_np = audio_48k[input_start:end]
-                    
-                    # --- CRITICAL FIX: Keep on CPU ---
-                    # Do NOT use .to(self.device) here. 'enhance' needs CPU input.
-                    chunk_tensor = torch.from_numpy(chunk_np).float().unsqueeze(0)
-                    
-                    with torch.no_grad():
-                        enhanced_tensor = enhance(self.df_model, self.df_state, chunk_tensor)
-                    
-                    # --- Post-Processing ---
-                    if isinstance(enhanced_tensor, tuple):
-                        enhanced_tensor = enhanced_tensor[0]
-                    
-                    enhanced_tensor = enhanced_tensor.detach().cpu()
-                    enhanced_chunk = enhanced_tensor.squeeze().numpy()
-                    
-                    valid_audio = enhanced_chunk[pad_left:]
-                    enhanced_parts.append(valid_audio)
-                    
-                    del chunk_tensor, enhanced_tensor
-                    torch.cuda.empty_cache()
-    
-                return np.concatenate(enhanced_parts)
-    
-            except Exception as e:
-                print(f"❌ Denoising failed with error: {e}")
-                import traceback
-                traceback.print_exc()
-                return audio_np
-    def generate_podcast_streaming(self, 
-                                 num_speakers: int,
-                                 script: str,
-                                 speaker_1: str = None,
-                                 speaker_2: str = None,
-                                 speaker_3: str = None,
-                                 speaker_4: str = None,
-                                 speaker_1_upload: str = None,
-                                 speaker_2_upload: str = None,
-                                 speaker_3_upload: str = None,
-                                 speaker_4_upload: str = None,
-                                 speaker_1_speed: float = 1.0,
-                                 speaker_2_speed: float = 1.0,
-                                 speaker_3_speed: float = 1.0,
-                                 speaker_4_speed: float = 1.0,
-                                 cfg_scale: float = 1.3,
-                                 ) -> Iterator[tuple]:
-        
-        # Setup output directory for local saving (redundant check but safe)
+        if not self.df_model: return audio_np
         try:
-            os.makedirs(self.output_dir, exist_ok=True)
+            if torch.is_tensor(audio_np): audio_np = audio_np.detach().cpu().numpy()
+            audio_np = audio_np.astype(np.float32)
+            target_sr = 48000
+            if sample_rate != target_sr: audio_48k = librosa.resample(audio_np, orig_sr=sample_rate, target_sr=target_sr)
+            else: audio_48k = audio_np
+
+            chunk_size = 48000 * 30 
+            enhanced_parts = []
+            for i in range(0, len(audio_48k), chunk_size):
+                chunk = audio_48k[i:i+chunk_size]
+                chunk_tensor = torch.from_numpy(chunk).float().unsqueeze(0)
+                with torch.no_grad(): enhanced = enhance(self.df_model, self.df_state, chunk_tensor)
+                enhanced_parts.append(enhanced[0].cpu().numpy().squeeze())
+            return np.concatenate(enhanced_parts)
         except Exception as e:
-            print(f"Warning: Could not create output directory: {e}")
+            print(f"Denoise Error: {e}")
+            return audio_np
 
+    def generate_podcast_streaming(self, num_speakers: int, script: str, speaker_1, speaker_2, speaker_3, speaker_4, 
+                                 speaker_1_upload, speaker_2_upload, speaker_3_upload, speaker_4_upload, 
+                                 speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed, cfg_scale,
+                                 stop_event: Optional[threading.Event] = None) -> Iterator[tuple]:
+        
+        start_time = time.time()
+        
         try:
-            
-            # Reset stop flag and set generating state
-            self.stop_generation = False
             self.is_generating = True
-            
-            # Validate inputs
-            if not script.strip():
-                self.is_generating = False
-                raise gr.Error("Error: Please provide a script.")
-
-            # Defend against common mistake
+            if not script.strip(): raise gr.Error("Please provide a script.")
             script = script.replace("’", "'")
             
-            if num_speakers < 1 or num_speakers > 4:
-                self.is_generating = False
-                raise gr.Error("Error: Number of speakers must be between 1 and 4.")
-            
-            # --- New Logic: Handle custom uploads and dropdowns ---
-            speaker_dropdowns = [speaker_1, speaker_2, speaker_3, speaker_4]
-            speaker_uploads = [speaker_1_upload, speaker_2_upload, speaker_3_upload, speaker_4_upload]
-            speaker_speeds = [speaker_1_speed, speaker_2_speed, speaker_3_speed, speaker_4_speed]
-            
-            selected_audio_paths = [] # This will store the final paths to load
-            selected_speaker_names_for_log = [] # For logging
-            
-            # Validate and select audio source for each speaker
-            for i in range(num_speakers):
-                upload_path = speaker_uploads[i]
-                dropdown_name = speaker_dropdowns[i]
-                
-                if upload_path and os.path.exists(upload_path):
-                    # User uploaded a custom voice
-                    selected_audio_paths.append(upload_path)
-                    selected_speaker_names_for_log.append(f"Custom (Speaker {i+1})")
-                elif dropdown_name and dropdown_name in self.available_voices:
-                    # User selected from dropdown, and no upload was provided
-                    selected_audio_paths.append(self.available_voices[dropdown_name])
-                    selected_speaker_names_for_log.append(dropdown_name)
-                else:
-                    # No valid selection for this speaker
-                    self.is_generating = False
-                    raise gr.Error(f"Error: Please select a default voice or upload a custom voice for Speaker {i+1}.")
-            # --- End New Logic ---
-
-            # Build initial log
-            log = f"🎙️ Generating Audio with {num_speakers} speakers\n"
-            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
-            log += f"🎭 Speakers: {', '.join(selected_speaker_names_for_log)}\n"
-            log += "🧹 Denoising: Enabled (DeepFilterNet, Mandatory)\n"
-            
-            # Check for stop signal
-            if self.stop_generation:
-                self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
-                return
-            
-            # Load voice samples
+            speaker_inputs = [
+                (speaker_1, speaker_1_upload, speaker_1_speed),
+                (speaker_2, speaker_2_upload, speaker_2_speed),
+                (speaker_3, speaker_3_upload, speaker_3_speed),
+                (speaker_4, speaker_4_upload, speaker_4_speed)
+            ]
             voice_samples = []
-            for i, audio_path in enumerate(selected_audio_paths):
-                audio_data = self.read_audio(audio_path)
-                if len(audio_data) == 0:
-                    self.is_generating = False
-                    raise gr.Error(f"Error: Failed to load audio for {selected_speaker_names_for_log[i]}")
-                
-                # --- START: Apply speed adjustment ---
-                speed_factor = speaker_speeds[i]
-                if speed_factor != 1.0:
-                    logger.info(f"Applying speed factor {speed_factor:.2f} to Speaker {i+1}")
-                    # 3. Pass the sample_rate (which is 24000)
-                    audio_data = self._adjust_voice_speed(audio_data, speed_factor, sample_rate=24000)
-                    # Update log name
-                    selected_speaker_names_for_log[i] += f" ({speed_factor:.2f}x speed)"
-                # --- END: Apply speed adjustment ---
-                
-                voice_samples.append(audio_data)
-            
-            # Check for stop signal
-            if self.stop_generation:
-                self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
-                return
-            
-            # Parse script to assign speaker ID's
-            lines = script.strip().split('\n')
-            formatted_script_lines = []
-            
+            for i in range(num_speakers):
+                dd, up, speed = speaker_inputs[i]
+                path = up if (up and os.path.exists(up)) else self.available_voices.get(dd)
+                if not path: raise gr.Error(f"Select voice for Speaker {i+1}")
+                audio = self.read_audio(path)
+                if len(audio) == 0: raise gr.Error(f"Failed to load audio for Speaker {i+1}")
+                if speed != 1.0: audio = self._adjust_voice_speed(audio, speed)
+                voice_samples.append(audio)
+
+            lines = [l.strip() for l in script.split('\n') if l.strip()]
+            formatted_turns = []
+            auto_idx = 0
             for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Check if line already has speaker format
-                if line.startswith('Speaker ') and ':' in line:
-                    formatted_script_lines.append(line)
+                # --- FIX: ALIGN SPEAKER TAGS ---
+                # Check for explicit tag "Speaker X:"
+                match = re.match(r'^Speaker\s+(\d+)\s*:(.*)', line, re.IGNORECASE)
+                if match:
+                    try:
+                        s_id = int(match.group(1))
+                        content = match.group(2).strip()
+                        
+                        # Correcting alignment:
+                        # User writes "Speaker 1" (1-based) -> We map to Index 0 (0-based)
+                        # User writes "Speaker 0" (0-based) -> We map to Index 0 (0-based)
+                        # This logic ensures "Speaker 1" uses the First voice (Index 0).
+                        if s_id > 0: s_id -= 1
+                        
+                        # Safety modulo to keep it valid
+                        s_id = s_id % num_speakers
+                        
+                        formatted_turns.append(f"Speaker {s_id}: {content}")
+                    except:
+                        formatted_turns.append(line)
+                elif line.startswith('Speaker ') and ':' in line:
+                    # Fallback for non-numeric tags
+                    formatted_turns.append(line)
                 else:
-                    # Auto-assign to speakers in rotation
-                    speaker_id = len(formatted_script_lines) % num_speakers
-                    formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
+                    # Auto-assign
+                    formatted_turns.append(f"Speaker {auto_idx % num_speakers}: {line}")
+                    auto_idx += 1
             
-            formatted_script = '\n'.join(formatted_script_lines)
-            log += f"📝 Formatted script with {len(formatted_script_lines)} turns\n\n"
-            log += "🔄 Processing (streaming mode)...\n"
-            
-            # Check for stop signal before processing
-            if self.stop_generation:
-                self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
-                return
-            
-            start_time = time.time()
-            
-            inputs = self.processor(
-                text=[formatted_script],
-                voice_samples=[voice_samples],
-                padding=True,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            # Move tensors to device - Handle "auto" map where parts are on different devices
-            # For split models, inputs usually go to the first device (cuda:0)
+            full_script = '\n'.join(formatted_turns)
+            log = f"🚀 Starting Generation (T4 Mode: {self.t4_mode} | Steps: {self.inference_steps})\nTurns: {len(formatted_turns)}\n"
+            yield None, None, log, gr.update(visible=True), "Calculating..."
+
+            inputs = self.processor(text=[full_script], voice_samples=[voice_samples], padding=True, return_tensors="pt", return_attention_mask=True)
             target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            
             for k, v in inputs.items():
-                if torch.is_tensor(v):
-                    inputs[k] = v.to(target_device)
+                if torch.is_tensor(v): inputs[k] = v.to(target_device)
             
-            # Create audio streamer
-            audio_streamer = AudioStreamer(
-                batch_size=1,
-                stop_signal=None,
-                timeout=None
-            )
-            
-            # Store current streamer for potential stopping
+            audio_streamer = AudioStreamer(batch_size=1)
             self.current_streamer = audio_streamer
             
-            # Start generation in a separate thread
-            generation_thread = threading.Thread(
+            thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer)
+                args=(inputs, cfg_scale, audio_streamer, stop_event)
             )
-            generation_thread.start()
+            thread.start()
             
-            # Wait for generation to actually start producing audio
-            time.sleep(1)
-
-            # Check for stop signal after thread start
-            if self.stop_generation:
-                audio_streamer.end()
-                generation_thread.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
-                self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
-                return
-
-            # Collect audio chunks as they arrive
             sample_rate = 24000
-            all_audio_chunks = []  # For final statistics AND local saving
-            pending_chunks = []  # Buffer for accumulating small chunks
-            chunk_count = 0
-            last_yield_time = time.time()
-            min_yield_interval = 15 # Yield every 15 seconds
-            min_chunk_size = sample_rate * 30 # At least 2 seconds of audio
-            
-            # Get the stream for the first (and only) sample
-            audio_stream = audio_streamer.get_stream(0)
-            
-            has_yielded_audio = False
-            has_received_chunks = False  # Track if we received any chunks at all
+            all_chunks = []
+            pending_chunks = []
             
             try:
-                for audio_chunk in audio_stream:
-                    # Check for stop signal in the streaming loop
-                    if self.stop_generation:
-                        audio_streamer.end()
-                        break
-                        
-                    chunk_count += 1
-                    has_received_chunks = True  # Mark that we received at least one chunk
+                for chunk in audio_streamer.get_stream(0):
+                    if stop_event and stop_event.is_set(): break
                     
-                    # Convert tensor to numpy
-                    if torch.is_tensor(audio_chunk):
-                        # Convert bfloat16 to float32 first, then to numpy
-                        if audio_chunk.dtype == torch.bfloat16:
-                            audio_chunk = audio_chunk.float()
-                        # Handle float16
-                        elif audio_chunk.dtype == torch.float16:
-                            audio_chunk = audio_chunk.float()
-                            
-                        audio_np = audio_chunk.cpu().numpy().astype(np.float32)
-                    else:
-                        audio_np = np.array(audio_chunk, dtype=np.float32)
+                    if torch.is_tensor(chunk): chunk = chunk.float().cpu().numpy().astype(np.float32)
+                    else: chunk = np.array(chunk, dtype=np.float32)
+                    if chunk.ndim > 1: chunk = chunk.squeeze()
                     
-                    # Ensure audio is 1D and properly normalized
-                    if len(audio_np.shape) > 1:
-                        audio_np = audio_np.squeeze()
+                    all_chunks.append(chunk)
+                    pending_chunks.append(convert_to_16_bit_wav(chunk))
                     
-                    # Convert to 16-bit for Gradio
-                    audio_16bit = convert_to_16_bit_wav(audio_np)
+                    pending_size = sum(len(c) for c in pending_chunks)
+                    current_duration = time.time() - start_time
+                    time_display = f"{current_duration:.1f}s"
                     
-                    # Store for final statistics
-                    all_audio_chunks.append(audio_np) # Store float for high quality re-assembly
-                    
-                    # Add to pending chunks buffer
-                    pending_chunks.append(audio_16bit)
-                    
-                    # Calculate pending audio size
-                    pending_audio_size = sum(len(chunk) for chunk in pending_chunks)
-                    current_time = time.time()
-                    time_since_last_yield = current_time - last_yield_time
-                    
-                    # Decide whether to yield
-                    should_yield = False
-                    if not has_yielded_audio and pending_audio_size >= min_chunk_size:
-                        # First yield: wait for minimum chunk size
-                        should_yield = True
-                        has_yielded_audio = True
-                    elif has_yielded_audio and (pending_audio_size >= min_chunk_size or time_since_last_yield >= min_yield_interval):
-                        # Subsequent yields: either enough audio or enough time has passed
-                        should_yield = True
-                    
-                    if should_yield and pending_chunks:
-                        # Concatenate and yield only the new audio chunks
-                        new_audio = np.concatenate(pending_chunks)
-                        total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
-                        
-                        log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
-                        
-                        # Yield streaming audio chunk and keep complete_audio as None during streaming
-                        yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
-                        
-                        # Clear pending chunks after yielding
+                    if pending_size > sample_rate * 2:
+                        yield (sample_rate, np.concatenate(pending_chunks)), None, log, gr.update(visible=True), time_display
                         pending_chunks = []
-                        last_yield_time = current_time
             
-            except GeneratorExit:
-                print("Client disconnected during streaming.")
-                # We catch this so the 'finally' block can run and save the audio
-            except Exception as e:
-                print(f"Error during streaming loop: {e}")
-                raise e
             finally:
-                # Ensure background thread is cleaned up
                 audio_streamer.end()
-                generation_thread.join(timeout=2.0)
+                thread.join()
+
+            total_time = time.time() - start_time
+            time_display = f"{total_time:.2f}s"
+
+            if all_chunks and not (stop_event and stop_event.is_set()):
+                full_audio = np.concatenate(all_chunks)
+                log += "\n🧹 Denoising (DeepFilterNet)..."
+                yield None, None, log, gr.update(visible=True), time_display
+                
+                denoised = self.denoise_audio(full_audio, sample_rate)
+                denoised_int16 = convert_to_16_bit_wav(denoised)
+                
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                wav_path = os.path.join(self.output_dir, f"rsr_tts_{ts}.wav")
+                sf.write(wav_path, denoised, 48000)
+                
+                mp3_path = os.path.join(self.output_dir, f"rsr_tts_{ts}.mp3")
+                try:
+                    subprocess.run(["ffmpeg", "-i", wav_path, "-acodec", "libmp3lame", "-b:a", "256k", "-ar", "48000", "-y", mp3_path], 
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    saved_msg = f"Saved: {os.path.basename(mp3_path)} & .wav"
+                except: saved_msg = f"Saved: {os.path.basename(wav_path)} (FFmpeg missing)"
+                
+                log += f"\n✅ {saved_msg}\n⏱️ Generation Time: {time_display}"
+                yield None, (48000, denoised_int16), log, gr.update(visible=False), time_display
             
-            # Yield any remaining chunks (if still connected)
-            if pending_chunks and not self.stop_generation:
-                final_new_audio = np.concatenate(pending_chunks)
-                total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
-                log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
-                yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
-                has_yielded_audio = True  # Mark that we yielded audio
-
-            # Clean up
-            self.current_streamer = None
-            self.is_generating = False
-            
-            generation_time = time.time() - start_time
-            
-            # Check if stopped by user
-            if self.stop_generation:
-                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
-                return
-            
-            # Process Full Audio (Concatenate + Denoise + Save)
-            if has_received_chunks and all_audio_chunks:
-                # Concatenate full float32 audio
-                complete_audio_float = np.concatenate(all_audio_chunks)
-                # --- SAVE 1: RAW AUDIO ---
-                original_audio_int16 = convert_to_16_bit_wav(complete_audio_float)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-                # Save as WAV (Raw)
-                raw_filename = f"rsr_tts_{timestamp}_raw.wav"
-                raw_filepath = os.path.join(self.output_dir, raw_filename)
-                
-                sf.write(raw_filepath, complete_audio_float, sample_rate)
-                print(f"✅ Raw Audio saved to: {raw_filepath}")
-
-
-                final_log = log + f"⏱️ Completed in {generation_time:.2f}s\n🎵 Duration: {len(complete_audio_float) / sample_rate:.2f}s\n"
-                final_log += f"💾 Raw Audio: {raw_filename}\n"
-
-                final_audio_int16 = original_audio_int16
-
-                # --- SAVE 2: DENOISED AUDIO (Mandatory) ---
-                # ... inside your generation loop ...
-                
-                # --- SAVE 2: DENOISED AUDIO ---
-                if self.df_model is not None:
-                    # 1. Get the 48k Denoised Audio
-                    denoised_audio_48k = self.denoise_audio(complete_audio_float, sample_rate)
-                    
-                    # 2. Define Filenames
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    wav_temp_path = os.path.join(self.output_dir, f"temp_{timestamp}.wav")
-                    mp3_filename = f"rsr_tts_{timestamp}_denoised.mp3"
-                    mp3_filepath = os.path.join(self.output_dir, mp3_filename)
-                
-                    # 3. Save Temporary WAV (48k)
-                    # We must save as WAV first because 'soundfile' cannot write MP3s natively reliably
-                    sf.write(wav_temp_path, denoised_audio_48k, 48000)
-                
-                    # 4. Convert to MP3 256k using FFmpeg
-                    # -y: overwrite if exists
-                    # -b:a 256k: Bitrate 256kbps
-                    # -ar 48000: Keep sample rate 48kHz
-                    print(f"💾 Compressing to MP3 (256k)...")
-                    try:
-                        command = [
-                            "ffmpeg", "-i", wav_temp_path,
-                            "-acodec", "libmp3lame",
-                            "-b:a", "256k",
-                            "-ar", "48000",
-                            "-loglevel", "error",
-                            "-y",
-                            mp3_filepath
-                        ]
-                        subprocess.run(command, check=True)
-                        print(f"✅ Saved: {mp3_filepath}")
-                        
-                        # 5. Delete Temp WAV to save space
-                        os.remove(wav_temp_path)
-                        
-                        # Update logs
-                        final_log += f"✨ Denoising applied!\n💾 Saved: {mp3_filename} (48kHz/256k)\n"
-                
-                    except Exception as e:
-                        print(f"⚠️ FFmpeg failed: {e}. Keeping the WAV file.")
-                        final_log += f"⚠️ Saved as WAV (FFmpeg error): {wav_temp_path}\n"
-                else:
-                    final_log += "⚠️ DeepFilterNet not available. Returning raw audio.\n"
-                    final_log += "✨ Generation successful! Complete audio is ready."
-                
-                yield None, (sample_rate, final_audio_int16), final_log, gr.update(visible=False)
-                return
-            
-            if not has_received_chunks:
-                error_log = log + f"\n❌ Error: No audio chunks were received from the model. Generation time: {generation_time:.2f}s"
-                yield None, None, error_log, gr.update(visible=False)
-                return
-
-        except gr.Error as e:
-            # Handle Gradio-specific errors (like input validation)
-            self.is_generating = False
-            self.current_streamer = None
-            error_msg = f"❌ Input Error: {str(e)}"
-            print(error_msg)
-            yield None, None, error_msg, gr.update(visible=False)
-            
-        except Exception as e:
-            self.is_generating = False
-            self.current_streamer = None
-            error_msg = f"❌ An unexpected error occurred: {str(e)}"
-            print(error_msg)
-            import traceback
-            traceback.print_exc()
-            yield None, None, error_msg, gr.update(visible=False)
-    
-    def _generate_with_streamer(self, inputs, cfg_scale, audio_streamer):
-        """Helper method to run generation with streamer in a separate thread."""
-        try:
-            # Clear CUDA cache before generation
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            if self.stop_generation:
-                audio_streamer.end()
-                return
-                
-            def check_stop_generation():
-                return self.stop_generation
-                
-            # Use inference_mode instead of no_grad for better memory optimization
-            with torch.inference_mode():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=None,
-                    cfg_scale=cfg_scale,
-                    tokenizer=self.processor.tokenizer,
-                    generation_config={
-                        'do_sample': False,
-                    },
-                    audio_streamer=audio_streamer,
-                    stop_check_fn=check_stop_generation,
-                    verbose=False,
-                    refresh_negative=True,
-                )
-            
-            # Clear cache after generation
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-        except Exception as e:
-            print(f"Error in generation thread: {e}")
-            traceback.print_exc()
-            audio_streamer.end()
-    
-    def stop_audio_generation(self):
-        """Stop the current audio generation process."""
-        self.stop_generation = True
-        if self.current_streamer is not None:
-            try:
-                self.current_streamer.end()
-            except Exception as e:
-                print(f"Error stopping streamer: {e}")
-        print("🛑 Audio generation stop requested")
-    
-    def load_example_scripts(self):
-        """Load example scripts from the text_examples directory."""
-        examples_dir = os.path.join(os.path.dirname(__file__), "text_examples")
-        self.example_scripts = []
-        
-        # Check if text_examples directory exists
-        if not os.path.exists(examples_dir):
-            print(f"Warning: text_examples directory not found at {examples_dir}")
-            return
-        
-        # Get all .txt files in the text_examples directory
-        txt_files = sorted([f for f in os.listdir(examples_dir) 
-                          if f.lower().endswith('.txt') and os.path.isfile(os.path.join(examples_dir, f))])
-        
-        for txt_file in txt_files:
-            file_path = os.path.join(examples_dir, txt_file)
-            
-            import re
-            # Check if filename contains a time pattern like "45min", "90min", etc.
-            time_pattern = re.search(r'(\d+)min', txt_file.lower())
-            if time_pattern:
-                minutes = int(time_pattern.group(1))
-                if minutes > 15:
-                    print(f"Skipping {txt_file}: duration {minutes} minutes exceeds 15-minute limit")
-                    continue
-
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    script_content = f.read().strip()
-                
-                # Remove empty lines and lines with only whitespace
-                script_content = '\n'.join(line for line in script_content.split('\n') if line.strip())
-                
-                if not script_content:
-                    continue
-                
-                # Parse the script to determine number of speakers
-                num_speakers = self._get_num_speakers_from_script(script_content)
-                
-                # Add to examples list as [num_speakers, script_content]
-                self.example_scripts.append([num_speakers, script_content])
-                print(f"Loaded example: {txt_file} with {num_speakers} speakers")
-                
-            except Exception as e:
-                print(f"Error loading example script {txt_file}: {e}")
-        
-        if self.example_scripts:
-            print(f"Successfully loaded {len(self.example_scripts)} example scripts")
-        else:
-            print("No example scripts were loaded")
-    
-    def _get_num_speakers_from_script(self, script: str) -> int:
-        """Determine the number of unique speakers in a script."""
-        import re
-        speakers = set()
-        
-        lines = script.strip().split('\n')
-        for line in lines:
-            # Use regex to find speaker patterns
-            match = re.match(r'^Speaker\s+(\d+)\s*:', line.strip(), re.IGNORECASE)
-            if match:
-                speaker_id = int(match.group(1))
-                speakers.add(speaker_id)
-        
-        # If no speakers found, default to 1
-        if not speakers:
-            return 1
-        
-        # Return the maximum speaker ID + 1 (assuming 0-based indexing)
-        # or the count of unique speakers if they're 1-based
-        max_speaker = max(speakers)
-        min_speaker = min(speakers)
-        
-        if min_speaker == 0:
-            return max_speaker + 1
-        else:
-            # Assume 1-based indexing, return the count
-            return len(speakers)
-    
-    def get_saved_files(self) -> List[str]:
-        """Get list of saved audio files sorted by creation time (newest first)."""
-        if not os.path.exists(self.output_dir):
-            return []
-            
-        try:
-            # Get all wav and mp3 files
-            files = [os.path.join(self.output_dir, f) for f in os.listdir(self.output_dir) 
-                    if f.lower().endswith(('.wav', '.mp3'))]
-            # Sort by modification time, newest first
-            files.sort(key=os.path.getmtime, reverse=True)
-            return files
-        except Exception as e:
-            print(f"Error listing saved files: {e}")
-            return []
-    
-
-def create_demo_interface(demo_instance: RSRTTSDemo):
-    """Create the Gradio interface with streaming support."""
-    
-    # Custom CSS for high-end aesthetics with lighter theme
-    custom_css = """
-    /* Modern light theme with gradients */
-    .gradio-container {
-        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
-        font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-    
-    /* Header styling */
-    .main-header {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 20px;
-        margin-bottom: 2rem;
-        text-align: center;
-        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
-    }
-    
-    .main-header h1 {
-        color: white;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin: 0;
-        text-shadow: 0 2px 4px rgba(0,0,0,0.3);
-    }
-    
-    .main-header p {
-        color: rgba(255,255,255,0.9);
-        font-size: 1.1rem;
-        margin: 0.5rem 0 0 0;
-    }
-    
-    /* Card styling */
-    .settings-card, .generation-card {
-        background: rgba(255, 255, 255, 0.8);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(226, 232, 240, 0.8);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Speaker selection styling */
-    .speaker-grid {
-        display: grid;
-        gap: 1rem;
-        margin-bottom: 1rem;
-    }
-    
-    .speaker-item {
-        background: linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%);
-        border: 1px solid rgba(148, 163, 184, 0.4);
-        border-radius: 12px;
-        padding: 1rem;
-        color: #374151;
-        font-weight: 500;
-    }
-    
-    /* Streaming indicator */
-    .streaming-indicator {
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        background: #22c55e;
-        border-radius: 50%;
-        margin-right: 8px;
-        animation: pulse 1.5s infinite;
-    }
-    
-    @keyframes pulse {
-        0% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.5; transform: scale(1.1); }
-        100% { opacity: 1; transform: scale(1); }
-    }
-    
-    /* Queue status styling */
-    .queue-status {
-        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-        border: 1px solid rgba(14, 165, 233, 0.3);
-        border-radius: 8px;
-        padding: 0.75rem;
-        margin: 0.5rem 0;
-        text-align: center;
-        font-size: 0.9rem;
-        color: #0369a1;
-    }
-    
-    .generate-btn {
-        background: linear-gradient(135deg, #059669 0%, #0d9488 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 2rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-        box-shadow: 0 4px 20px rgba(5, 150, 105, 0.4);
-        transition: all 0.3s ease;
-    }
-    
-    .generate-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(5, 150, 105, 0.6);
-    }
-    
-    .stop-btn {
-        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 2rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-        box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
-        transition: all 0.3s ease;
-    }
-    
-    .stop-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(239, 68, 68, 0.6);
-    }
-    
-    /* Audio player styling */
-    .audio-output {
-        background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
-        border-radius: 16px;
-        padding: 1.5rem;
-        border: 1px solid rgba(148, 163, 184, 0.3);
-    }
-    
-    .complete-audio-section {
-        margin-top: 1rem;
-        padding: 1rem;
-        background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
-        border: 1px solid rgba(34, 197, 94, 0.3);
-        border-radius: 12px;
-    }
-    
-    /* Text areas */
-    .script-input, .log-output {
-        background: rgba(255, 255, 255, 0.9) !important;
-        border: 1px solid rgba(148, 163, 184, 0.4) !important;
-        border-radius: 12px !important;
-        color: #1e293b !important;
-        font-family: 'JetBrains Mono', monospace !important;
-    }
-    
-    .script-input::placeholder {
-        color: #64748b !important;
-    }
-    
-    /* Sliders */
-    .slider-container {
-        background: rgba(248, 250, 252, 0.8);
-        border: 1px solid rgba(226, 232, 240, 0.6);
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
-    
-    /* Labels and text */
-    .gradio-container label {
-        color: #374151 !important;
-        font-weight: 600 !important;
-    }
-    
-    .gradio-container .markdown {
-        color: #1f2937 !important;
-    }
-    
-    /* Responsive design */
-    @media (max-width: 768px) {
-        .main-header h1 { font-size: 2rem; }
-        .settings-card, .generation-card { padding: 1rem; }
-    }
-    
-    /* Random example button styling - more subtle professional color */
-    .random-btn {
-        background: linear-gradient(135deg, #64748b 0%, #475569 100%);
-        border: none;
-        border-radius: 12px;
-        padding: 1rem 1.5rem;
-        color: white;
-        font-weight: 600;
-        font-size: 1rem;
-        box-shadow: 0 4px 20px rgba(100, 116, 139, 0.3);
-        transition: all 0.3s ease;
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-    
-    .random-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 25px rgba(100, 116, 139, 0.4);
-        background: linear-gradient(135deg, #475569 0%, #334155 100%);
-    }
-
-    /* --- Dropdown fixes: ensure correct stacking & positioning --- */
-    /* Allow popovers to overflow card boundaries */
-    .settings-card,
-    .generation-card,
-    .speaker-item { overflow: visible !important; }
-
-    /* Provide local positioning context and raise stacking */
-    .speaker-item { position: relative; z-index: 1000 !important; }
-
-    /* Gradio dropdown popover wrapper is usually an .absolute sibling of input within .wrap */
-    .speaker-item .wrap { overflow: visible !important; position: relative; }
-    .speaker-item .wrap > .absolute {
-        z-index: 10000 !important;
-        top: calc(100% + 6px) !important;
-        bottom: auto !important;
-        transform-origin: top !important;
-    }
-
-    /* Also elevate the ARIA listbox in case it has a separate stacking context */
-    .gradio-container div[role="listbox"] { z-index: 200000 !important; }
-
-    /* General fallback for absolute popovers used by Gradio */
-    .gradio-container .absolute,
-    .gradio-container .z-20,
-    .gradio-container .z-30,
-    .gradio-container .z-40,
-    .gradio-container .z-50 { z-index: 200000 !important; }
-
-    /* Ensure portal-based menus are above everything */
-    .fixed { z-index: 300000 !important; }
-
-    /* Ensure slider does not sit above dropdown popovers */
-    .slider-container { position: relative; z-index: 0 !important; overflow: visible !important; }
-    .slider-container input[type="range"] { position: relative; z-index: 0 !important; }
-
-    /* ========================= */
-    /* Dark Mode          */
-    /* ========================= */
-    :root { color-scheme: dark; }
-
-    .gradio-container {
-        background: radial-gradient(1200px 800px at 20% 0%, #0b1220 0%, #0a0f1a 40%, #090e19 100%);
-        color: #e5e7eb;
-    }
-
-    .main-header {
-        background: linear-gradient(90deg, #0ea5e9 0%, #7c3aed 100%);
-        box-shadow: 0 10px 40px rgba(20, 184, 166, 0.15);
-    }
-    .main-header h1 { color: #ffffff; }
-    .main-header p { color: rgba(255,255,255,0.82); }
-
-    .settings-card, .generation-card {
-        background: rgba(2, 6, 23, 0.72);
-        border: 1px solid rgba(51, 65, 85, 0.7);
-        box-shadow: 0 8px 32px rgba(2, 6, 23, 0.6);
-    }
-
-    .speaker-item {
-        background: linear-gradient(135deg, #0f172a 0%, #111827 100%);
-        border: 1px solid rgba(71, 85, 105, 0.55);
-        color: #e2e8f0;
-    }
-
-    .generate-btn {
-        background: linear-gradient(135deg, #059669 0%, #0f766e 100%);
-        box-shadow: 0 4px 20px rgba(5, 150, 105, 0.35);
-    }
-    .generate-btn:hover {
-        box-shadow: 0 6px 25px rgba(5, 150, 105, 0.55);
-    }
-
-    .stop-btn {
-        background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%);
-        box-shadow: 0 4px 20px rgba(220, 38, 38, 0.35);
-    }
-    .stop-btn:hover {
-        box-shadow: 0 6px 25px rgba(220, 38, 38, 0.55);
-    }
-
-    .random-btn {
-        background: linear-gradient(135deg, #334155 0%, #1f2937 100%);
-        box-shadow: 0 4px 20px rgba(31, 41, 55, 0.35);
-        color: #e5e7eb;
-    }
-    .random-btn:hover {
-        background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
-        box-shadow: 0 6px 25px rgba(31, 41, 55, 0.5);
-    }
-
-    .audio-output {
-        background: linear-gradient(135deg, #0b1220 0%, #0f172a 100%);
-        border: 1px solid rgba(51, 65, 85, 0.6);
-    }
-
-    .complete-audio-section {
-        background: linear-gradient(135deg, rgba(6, 78, 59, 0.2) 0%, rgba(4, 120, 87, 0.15) 100%);
-        border: 1px solid rgba(16, 185, 129, 0.35);
-    }
-
-    .script-input, .log-output {
-        background: rgba(15, 23, 42, 0.92) !important;
-        border: 1px solid rgba(51, 65, 85, 0.8) !important;
-        color: #e2e8f0 !important;
-    }
-    .script-input::placeholder { color: #94a3b8 !important; }
-
-    .slider-container {
-        background: rgba(2, 6, 23, 0.6);
-        border: 1px solid rgba(51, 65, 85, 0.7);
-    }
-
-    .gradio-container label { color: #e2e8f0 !important; }
-    .gradio-container .markdown { color: #e5e7eb !important; }
-
-    /* Dropdown menu dark palette */
-    .gradio-container div[role="listbox"] {
-        background-color: #0b1220 !important;
-        border: 1px solid #334155 !important;
-        color: #e5e7eb !important;
-        box-shadow: 0 12px 32px rgba(2, 6, 23, 0.7);
-    }
-    .gradio-container [role="option"] {
-        color: #e5e7eb !important;
-    }
-    .gradio-container [role="option"][aria-selected="true"],
-    .gradio-container [role="option"]:hover {
-        background-color: #0f172a !important;
-    }
-
-    /* Remove blur/backdrop filters that create problematic stacking/containing contexts */
-    .settings-card, .generation-card {
-        -webkit-backdrop-filter: none !important;
-        backdrop-filter: none !important;
-        /* position: relative;  <-- REMOVED to fix dropdown clipping */
-        /* z-index: 0;          <-- REMOVED to fix dropdown clipping */
-    }
-    """
-    
-    with gr.Blocks(
-        title="RSR TTS",
-        css=custom_css,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="purple",
-            neutral_hue="slate",
-        )
-    ) as interface:
-        
-        # Header
-        gr.HTML("""
-        <div class="main-header">
-            <h1>RSR TTS</h1>
-        </div>
-        """)
-        
-        with gr.Row():
-            # Left column - Settings
-            with gr.Column(scale=1, elem_classes="settings-card"):
-                gr.Markdown("### 🎛️ **Audio Settings**")
-                
-                # Number of speakers
-                num_speakers = gr.Slider(
-                    minimum=1,
-                    maximum=4,
-                    value=2,
-                    step=1,
-                    label="Number of Speakers",
-                    elem_classes="slider-container"
-                )
-                
-                # Speaker selection
-                gr.Markdown("### 🎭 **Speaker Selection**")
-                
-                available_speaker_names = list(demo_instance.available_voices.keys())
-                default_speakers = ['en-Alice_woman', 'en-Carter_man', 'en-Frank_man', 'en-Maya_woman']
-
-                speaker_selections = []
-                speaker_uploads = []
-                speaker_speed_sliders = [] # <-- NEW
-                speaker_groups = []
-                for i in range(4):
-                    with gr.Group(visible=(i < 2), elem_classes="speaker-item") as speaker_group:
-                        default_value = default_speakers[i] if i < len(default_speakers) else None
-                        speaker_dd = gr.Dropdown(
-                            choices=available_speaker_names,
-                            value=default_value,
-                            label=f"Speaker {i+1} (Default Voice)",
-                        )
-                        speaker_up = gr.Audio(
-                            label=f"OR Upload Custom Voice for Speaker {i+1}",
-                            type="filepath",  # Use filepath to get a temp path to the uploaded file
-                            sources=["upload", "microphone"],
-                        )
-                        # --- START: Add speed slider ---
-                        speaker_speed = gr.Slider(
-                            minimum=0.8,
-                            maximum=1.2,
-                            value=1.0,
-                            step=0.01,
-                            label="Voice Speed",
-                            info="< 1.0 = Slower, > 1.0 = Faster",
-                            elem_classes="slider-container"
-                        )
-                        # --- END: Add speed slider ---
-                    speaker_selections.append(speaker_dd)
-                    speaker_uploads.append(speaker_up)
-                    speaker_speed_sliders.append(speaker_speed) # <-- NEW
-                    speaker_groups.append(speaker_group)
-                
-                # Advanced settings
-                gr.Markdown("### ⚙️ **Advanced Settings**")
-                
-                # Sampling parameters (contains all generation settings)
-                with gr.Accordion("Generation Parameters", open=False):
-                    cfg_scale = gr.Slider(
-                        minimum=1.0,
-                        maximum=4.0,
-                        value=1.3,
-                        step=0.05,
-                        label="CFG Scale (Guidance Strength)",
-                        # info="Higher values increase adherence to text",
-                        elem_classes="slider-container"
-                    )
-                
-            # Right column - Generation
-            with gr.Column(scale=2, elem_classes="generation-card"):
-                gr.Markdown("### 📝 **Script Input**")
-                
-                script_input = gr.Textbox(
-                    label="Conversation Script",
-                    placeholder="""Enter your Audio script here. You can format it as:
-
-Speaker 1: Welcome to our Show today!
-Speaker 2: Thanks for having me. I'm excited to discuss...
-
-Or paste text directly and it will auto-assign speakers.""",
-                    lines=12,
-                    max_lines=20,
-                    elem_classes="script-input"
-                )
-                
-                # Button row with Random Example on the left and Generate on the right
-                with gr.Row():
-                    # Random example button (now on the left)
-                    random_example_btn = gr.Button(
-                        "🎲 Random Example",
-                        size="lg",
-                        variant="secondary",
-                        elem_classes="random-btn",
-                        scale=1  # Smaller width
-                    )
-                    
-                    # Generate button (now on the right)
-                    generate_btn = gr.Button(
-                        "🚀 Generate Audio",
-                        size="lg",
-                        variant="primary",
-                        elem_classes="generate-btn",
-                        scale=2  # Wider than random button
-                    )
-                
-                # Stop button
-                stop_btn = gr.Button(
-                    "🛑 Stop Generation",
-                    size="lg",
-                    variant="stop",
-                    elem_classes="stop-btn",
-                    visible=False
-                )
-                
-                # Streaming status indicator
-                streaming_status = gr.HTML(
-                    value="""
-                    <div style="background: linear-gradient(135deg, #dcfce7 0%, #bbf7d0 100%); 
-                                border: 1px solid rgba(34, 197, 94, 0.3); 
-                                border-radius: 8px; 
-                                padding: 0.75rem; 
-                                margin: 0.5rem 0;
-                                text-align: center;
-                                font-size: 0.9rem;
-                                color: #166534;">
-                        <span class="streaming-indicator"></span>
-                        <strong>LIVE STREAMING</strong> - Audio is being generated in real-time
-                    </div>
-                    """,
-                    visible=False,
-                    elem_id="streaming-status"
-                )
-                
-                # Output section
-                gr.Markdown("### 🎵 **Generated Audio**")
-                
-                # Streaming audio output (outside of tabs for simpler handling)
-                audio_output = gr.Audio(
-                    label="Streaming Audio (Real-time)",
-                    type="numpy",
-                    elem_classes="audio-output",
-                    streaming=True,  # Enable streaming mode
-                    autoplay=True,
-                    show_download_button=False,  # Explicitly show download button
-                    visible=True
-                )
-                
-                # Complete audio output (non-streaming)
-                complete_audio_output = gr.Audio(
-                    label="Complete Audio (Denoised Output)",
-                    type="numpy",
-                    elem_classes="audio-output complete-audio-section",
-                    streaming=False,  # Non-streaming mode
-                    autoplay=False,
-                    show_download_button=True,  # Explicitly show download button
-                    visible=False  # Initially hidden, shown when audio is ready
-                )
-                
-                gr.Markdown("""
-                *💡 **Streaming**: Audio plays as it's being generated (may have slight pauses)  
-                *💡 **Complete Audio**: Final high-quality, denoised audio*
-                """)
-                
-                # Generation log
-                log_output = gr.Textbox(
-                    label="Generation Log",
-                    lines=8,
-                    max_lines=15,
-                    interactive=False,
-                    elem_classes="log-output"
-                )
-        
-        # --- New Section: Saved Files ---
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### 📂 **Saved Audio Files**")
-                gr.Markdown("All generated audio is automatically saved locally. Click refresh to see the latest files.")
-                
-                with gr.Row():
-                    refresh_files_btn = gr.Button("🔄 Refresh File List", variant="secondary", size="sm", scale=0)
-                
-                saved_files_output = gr.File(
-                    label="History (Downloadable)",
-                    file_count="multiple",
-                    type="filepath",
-                    interactive=False,
-                    value=demo_instance.get_saved_files  # Load initially
-                )
-                
-                # Connect refresh button
-                refresh_files_btn.click(
-                    fn=demo_instance.get_saved_files,
-                    inputs=[],
-                    outputs=[saved_files_output]
-                )
-        
-        def update_speaker_visibility(num_speakers):
-            updates = []
-            for i in range(4):
-                updates.append(gr.update(visible=(i < num_speakers)))
-            return updates
-        
-        num_speakers.change(
-            fn=update_speaker_visibility,
-            inputs=[num_speakers],
-            outputs=speaker_groups # Target the groups for visibility
-        )
-        
-        # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, *speakers_and_params):
-            """Wrapper function to handle the streaming generation call."""
-            try:
-                # Extract speakers and parameters
-                # 4 dropdowns + 4 uploads + 4 speed + 1 cfg_scale = 13 params
-                dropdown_selections = speakers_and_params[0:4]
-                upload_selections = speakers_and_params[4:8]
-                speed_selections = speakers_and_params[8:12] # <-- NEW
-                cfg_scale = speakers_and_params[12] # <-- Index updated
-                
-                # Clear outputs and reset visibility at start
-                yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
-                
-                # The generator will yield multiple times
-                final_log = "Starting generation..."
-                
-                for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
-                    num_speakers=int(num_speakers),
-                    script=script,
-                    speaker_1=dropdown_selections[0],
-                    speaker_2=dropdown_selections[1],
-                    speaker_3=dropdown_selections[2],
-                    speaker_4=dropdown_selections[3],
-                    speaker_1_upload=upload_selections[0],
-                    speaker_2_upload=upload_selections[1],
-                    speaker_3_upload=upload_selections[2],
-                    speaker_4_upload=upload_selections[3],
-                    speaker_1_speed=speed_selections[0], # <-- NEW
-                    speaker_2_speed=speed_selections[1], # <-- NEW
-                    speaker_3_speed=speed_selections[2], # <-- NEW
-                    speaker_4_speed=speed_selections[3], # <-- NEW
-                    cfg_scale=cfg_scale
-                ):
-                    final_log = log
-                    
-                    # Check if we have complete audio (final yield)
-                    if complete_audio is not None:
-                        # Final state: clear streaming, show complete audio
-                        yield None, gr.update(value=complete_audio, visible=True), log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-                    else:
-                        # Streaming state: update streaming audio only
-                        if streaming_audio is not None:
-                            yield streaming_audio, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
-                        else:
-                            # No new audio, just update status
-                            yield None, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
-
-            except Exception as e:
-                error_msg = f"❌ A critical error occurred in the wrapper: {str(e)}"
-                print(error_msg)
-                import traceback
-                traceback.print_exc()
-                # Reset button states on error
-                yield None, gr.update(value=None, visible=False), error_msg, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        
-        def stop_generation_handler():
-            """Handle stopping generation."""
-            demo_instance.stop_audio_generation()
-            # Return values for: log_output, streaming_status, generate_btn, stop_btn
-            return "🛑 Generation stopped.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        
-        # Add a clear audio function
-        def clear_audio_outputs():
-            """Clear both audio outputs before starting new generation."""
-            return None, gr.update(value=None, visible=False)
-
-        # Connect generation button with streaming outputs
-        generate_btn.click(
-            fn=clear_audio_outputs,
-            inputs=[],
-            outputs=[audio_output, complete_audio_output],
-            queue=False
-        ).then(  # Immediate UI update to hide Generate, show Stop (non-queued)
-            fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
-            inputs=[],
-            outputs=[generate_btn, stop_btn],
-            queue=False
-        ).then(
-            fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + speaker_uploads + speaker_speed_sliders + [cfg_scale], # Pass all lists
-            outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
-            queue=True  # Enable Gradio's built-in queue
-        ).then( # Auto-refresh file list after generation finishes
-            fn=demo_instance.get_saved_files,
-            inputs=[],
-            outputs=[saved_files_output],
-            queue=False
-        )
-        
-        # Connect stop button
-        stop_btn.click(
-            fn=stop_generation_handler,
-            inputs=[],
-            outputs=[log_output, streaming_status, generate_btn, stop_btn],
-            queue=False  # Don't queue stop requests
-        ).then(
-            # Clear both audio outputs after stopping
-            fn=lambda: (None, None),
-            inputs=[],
-            outputs=[audio_output, complete_audio_output],
-            queue=False
-        )
-        
-        # Function to randomly select an example
-        def load_random_example():
-            """Randomly select and load an example script."""
-            import random
-            
-            # Get available examples
-            if hasattr(demo_instance, 'example_scripts') and demo_instance.example_scripts:
-                example_scripts = demo_instance.example_scripts
+            elif stop_event and stop_event.is_set():
+                yield None, None, "🛑 Stopped.", gr.update(visible=False), time_display
             else:
-                # Fallback to default
-                example_scripts = [
-                    [2, "Speaker 0: Welcome to our AI Audio demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
-                ]
-            
-            # Randomly select one
-            if example_scripts:
-                selected = random.choice(example_scripts)
-                num_speakers_value = selected[0]
-                script_value = selected[1]
-                
-                # Return the values to update the UI
-                return num_speakers_value, script_value
-            
-            # Default values if no examples
-            return 2, ""
-        
-        # Connect random example button
-        random_example_btn.click(
-            fn=load_random_example,
-            inputs=[],
-            outputs=[num_speakers, script_input],
-            queue=False  # Don't queue this simple operation
-        )
-        
-        # Add usage tips
-        gr.Markdown("""
-        ### 💡 **Usage Tips**
-        
-        - Click **🚀 Generate Audio** to start audio generation
-        - **Live Streaming** tab shows audio as it's generated (may have slight pauses)
-        - **Complete Audio** tab provides the full, uninterrupted Audio after generation
-        - During generation, you can click **🛑 Stop Generation** to interrupt the process
-        - The streaming indicator shows real-time generation progress
-        """)
-        
-        # Add example scripts
-        gr.Markdown("### 📚 **Example Scripts**")
-        
-        # Use dynamically loaded examples if available, otherwise provide a default
-        if hasattr(demo_instance, 'example_scripts') and demo_instance.example_scripts:
-            example_scripts = demo_instance.example_scripts
-        else:
-            # Fallback to a simple default example if no scripts loaded
-            example_scripts = [
-                [1, "Speaker 1: Welcome to our AI Audio demonstration! This is a sample script showing how the model can generate natural-sounding speech."]
-            ]
-        
-        gr.Examples(
-            examples=example_scripts,
-            inputs=[num_speakers, script_input],
-            label="Try these example scripts:"
-        )
+                 yield None, None, "❌ Error: No audio.", gr.update(visible=False), time_display
 
+        except Exception as e:
+            traceback.print_exc()
+            yield None, None, f"Error: {e}", gr.update(visible=False), "Error"
+        finally:
+            self.is_generating = False
+
+    def _generate_with_streamer(self, inputs, cfg_scale, streamer, stop_event=None):
+        try:
+            torch.cuda.empty_cache()
+            
+            # --- CRITICAL: Wait for Queue ---
+            with self.gpu_lock:
+                # --- CHECK STOP AGAIN AFTER WAITING ---
+                if stop_event and stop_event.is_set():
+                    streamer.end()
+                    return
+
+                with torch.inference_mode():
+                    self.model.generate(
+                        **inputs,
+                        cfg_scale=cfg_scale,
+                        tokenizer=self.processor.tokenizer,
+                        generation_config={'do_sample': False},
+                        audio_streamer=streamer,
+                        # Pass the unique stop event to the model
+                        stop_check_fn=lambda: stop_event.is_set() if stop_event else False,
+                        verbose=False,
+                        refresh_negative=True,
+                    )
+        except Exception as e:
+            print(f"Gen Error: {e}")
+            traceback.print_exc()
+            streamer.end()
+
+    def stop_live_generation(self):
+        """Signals ONLY the live job to stop."""
+        if self.active_live_stop_event:
+            self.active_live_stop_event.set()
+            if self.current_streamer: self.current_streamer.end()
+
+    def start_background_task(self, num_speakers, script, 
+                            s1_d, s2_d, s3_d, s4_d, s1_u, s2_u, s3_u, s4_u, s1_s, s2_s, s3_s, s4_s, cfg_scale):
+        
+        job_id = str(uuid.uuid4())[:8]
+        BACKGROUND_JOBS[job_id] = {"status": "running", "log": "Initializing...", "audio": None}
+        
+        # Unique stop event for this specific background job (independent of live job)
+        bg_stop_event = threading.Event()
+
+        def task_runner():
+            try:
+                generator = self.generate_podcast_streaming(
+                    num_speakers, script, s1_d, s2_d, s3_d, s4_d, s1_u, s2_u, s3_u, s4_u, s1_s, s2_s, s3_s, s4_s, cfg_scale,
+                    stop_event=bg_stop_event
+                )
+                final_audio = None
+                last_log = ""
+                
+                for stream_out, final_out, log_msg, _, _ in generator:
+                    BACKGROUND_JOBS[job_id]["log"] = log_msg
+                    last_log = log_msg
+                    if final_out is not None: final_audio = final_out
+
+                if bg_stop_event.is_set():
+                     BACKGROUND_JOBS[job_id]["status"] = "stopped"
+                     BACKGROUND_JOBS[job_id]["log"] = last_log + "\n🛑 Job Stopped."
+                else:
+                    BACKGROUND_JOBS[job_id]["status"] = "completed"
+                    BACKGROUND_JOBS[job_id]["audio"] = final_audio
+                    BACKGROUND_JOBS[job_id]["log"] = last_log + "\n✅ Background Task Finished."
+                
+            except Exception as e:
+                BACKGROUND_JOBS[job_id]["status"] = "failed"
+                BACKGROUND_JOBS[job_id]["log"] += f"\n❌ Error: {str(e)}"
+                traceback.print_exc()
+
+        t = threading.Thread(target=task_runner)
+        t.daemon = True 
+        t.start()
+        return job_id
+
+    def check_job_status(self, job_id):
+        job = BACKGROUND_JOBS.get(job_id)
+        if not job: return None, "❌ Job ID not found.", gr.update(visible=False)
+        
+        if job["status"] == "running":
+            log_msg = job['log']
+            if "Calculating..." in log_msg and self.gpu_lock.locked(): log_msg += "\n(Waiting for GPU access...)"
+            return None, f"⏳ Processing...\n\nLogs:\n{log_msg}", gr.update(visible=False)
+        
+        elif job["status"] == "failed": return None, f"❌ Failed.\n\nLogs:\n{job['log']}", gr.update(visible=False)
+        elif job["status"] == "stopped": return None, f"🛑 Stopped.\n\nLogs:\n{job['log']}", gr.update(visible=False)
+        elif job["status"] == "completed": return job["audio"], f"✅ Done!\n\nLogs:\n{job['log']}", gr.update(visible=True)
+        return None, "Unknown Status", gr.update(visible=False)
+
+    def get_saved_files(self):
+        if not os.path.exists(self.output_dir): return []
+        files = [os.path.join(self.output_dir, f) for f in os.listdir(self.output_dir) if f.endswith('.wav') or f.endswith('.mp3')]
+        files.sort(key=os.path.getmtime, reverse=True)
+        return files
+    
+    def load_example_scripts(self): self.example_scripts = [] 
+
+def convert_to_16_bit_wav(data):
+    if torch.is_tensor(data): data = data.detach().cpu().numpy()
+    data = np.array(data)
+    if np.max(np.abs(data)) > 1.0: data = data / np.max(np.abs(data))
+    return (data * 32767).astype(np.int16)
+
+def create_demo_interface(demo):
+    with gr.Blocks(title="RSR TTS (T4 Optimized)", theme=gr.themes.Soft()) as interface:
+        gr.Markdown("# RSR TTS (T4 Optimized Mode)")
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                num_speakers = gr.Slider(1, 4, value=2, step=1, label="Speakers")
+                spk_inputs = []
+                for i in range(4):
+                    with gr.Group(visible=(i<2)) as g:
+                        dd = gr.Dropdown(list(demo.available_voices.keys()), label=f"Speaker {i+1}")
+                        up = gr.Audio(type="filepath", label="Upload")
+                        spd = gr.Slider(0.5, 2.0, value=1.0, label="Speed")
+                        spk_inputs.extend([dd, up, spd])
+                        def update_vis(n, idx=i, grp=g): return gr.update(visible=(idx < n))
+                        num_speakers.change(update_vis, num_speakers, g)
+                cfg = gr.Slider(1.0, 3.0, value=1.5, label="CFG Scale")
+                gr.Markdown("### 📂 Saved History")
+                refresh_btn = gr.Button("🔄 Refresh Files")
+                history_files = gr.File(label="Download Generated Files", file_count="multiple", value=demo.get_saved_files())
+                refresh_btn.click(lambda: demo.get_saved_files(), None, history_files)
+
+            with gr.Column(scale=2):
+                with gr.Tabs():
+                    with gr.Tab("🎙️ Live Streaming"):
+                        script = gr.Textbox(lines=10, label="Script", placeholder="Speaker 1: Hello...")
+                        with gr.Row():
+                            btn = gr.Button("Generate", variant="primary")
+                            stop = gr.Button("Stop", variant="stop", visible=False)
+                        time_box = gr.Textbox(label="Generation Time", value="0.0s", interactive=False)
+                        stream_out = gr.Audio(label="Streaming", streaming=True, autoplay=True)
+                        final_out = gr.Audio(label="Final (Denoised)", type="numpy")
+                        log = gr.Textbox(label="Logs")
+
+                        def wrapper(n, scr, *args):
+                            spk_data, cfg_val = args[:-1], args[-1]
+                            s1_d, s1_u, s1_s = spk_data[0:3]
+                            s2_d, s2_u, s2_s = spk_data[3:6]
+                            s3_d, s3_u, s3_s = spk_data[6:9]
+                            s4_d, s4_u, s4_s = spk_data[9:12]
+                            
+                            # Create a unique stop signal for this specific run
+                            stop_event = threading.Event()
+                            demo.active_live_stop_event = stop_event
+                            
+                            yield None, None, "Starting...", gr.update(visible=True), "0.0s"
+                            for out in demo.generate_podcast_streaming(n, scr, s1_d, s2_d, s3_d, s4_d, s1_u, s2_u, s3_u, s4_u, s1_s, s2_s, s3_s, s4_s, cfg_val, stop_event=stop_event):
+                                yield out
+
+                        btn.click(lambda: (gr.update(visible=False), gr.update(visible=True)), None, [btn, stop]) \
+                            .then(wrapper, [num_speakers, script] + spk_inputs + [cfg], [stream_out, final_out, log, stop, time_box]) \
+                            .then(lambda: (gr.update(visible=True), gr.update(visible=False)), None, [btn, stop]) \
+                            .then(lambda: demo.get_saved_files(), None, history_files)
+                        stop.click(demo.stop_live_generation, None, None)
+
+                    with gr.Tab("☁️ Background Job (Disconnect Safe)"):
+                        gr.Markdown("Use this mode to start a long job. You can close the tab and check back later using the **Job ID**.")
+                        bg_script = gr.Textbox(lines=10, label="Script", placeholder="Paste script here...")
+                        with gr.Row(): bg_btn = gr.Button("🚀 Start Background Job", variant="primary")
+                        bg_output_info = gr.Textbox(label="Job ID (Save this!)", interactive=False)
+                        gr.Markdown("---")
+                        gr.Markdown("### Check Job Status")
+                        with gr.Row():
+                            job_id_input = gr.Textbox(label="Enter Job ID", placeholder="e.g. a1b2c3d4")
+                            check_btn = gr.Button("Check Status")
+                        bg_status_log = gr.Textbox(label="Status / Logs")
+                        bg_audio_out = gr.Audio(label="Final Audio", visible=False)
+
+                        def bg_wrapper(n, scr, *args):
+                            spk_data, cfg_val = args[:-1], args[-1]
+                            s1_d, s1_u, s1_s = spk_data[0:3]
+                            s2_d, s2_u, s2_s = spk_data[3:6]
+                            s3_d, s3_u, s3_s = spk_data[6:9]
+                            s4_d, s4_u, s4_s = spk_data[9:12]
+                            job_id = demo.start_background_task(n, scr, s1_d, s2_d, s3_d, s4_d, s1_u, s2_u, s3_u, s4_u, s1_s, s2_s, s3_s, s4_s, cfg_val)
+                            return f"Job started! ID: {job_id}"
+
+                        bg_btn.click(bg_wrapper, [num_speakers, bg_script] + spk_inputs + [cfg], bg_output_info)
+                        check_btn.click(demo.check_job_status, inputs=[job_id_input], outputs=[bg_audio_out, bg_status_log, bg_audio_out])
 
     return interface
 
-
-def convert_to_16_bit_wav(data):
-    # Check if data is a tensor and move to cpu
-    if torch.is_tensor(data):
-        data = data.detach().cpu().numpy()
-    
-    # Ensure data is numpy array
-    data = np.array(data)
-
-    # Normalize to range [-1, 1] if it's not already
-    if np.max(np.abs(data)) > 1.0:
-        data = data / np.max(np.abs(data))
-    
-    # Scale to 16-bit integer range
-    data = (data * 32767).astype(np.int16)
-    return data
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="RSR TTS Gradio Demo")
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="/models/VibeVoice-large",
-        help="Path to the TTS model directory",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device for inference (default: cuda)",
-    )
-    parser.add_argument(
-        "--inference_steps",
-        type=int,
-        default=10,
-        help="Number of inference steps for DDPM (not exposed to users)",
-    )
-    parser.add_argument(
-        "--share",
-        action="store_true",
-        help="Share the demo publicly via Gradio",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=7860,
-        help="Port to run the demo on",
-    )
-    # NEW ARGUMENT
-    parser.add_argument(
-        "--auto_device_map",
-        action="store_true",
-        default=False,
-        help="Use device_map='auto' for loading the model. Helps with VRAM on smaller GPUs but may need careful layer splitting.",
-    )
-    
-    return parser.parse_args()
-
-
 def main():
-    """Main function to run the demo."""
-    args = parse_args()
-    
-    set_seed(42)  # Set a fixed seed for reproducibility
-
-    print("🎙️ Initializing RSR TTS Demo with Streaming Support...")
-    
-    # Initialize demo instance
-    demo_instance = RSRTTSDemo(
-        model_path=args.model_path,
-        device=args.device,
-        inference_steps=args.inference_steps,
-        auto_device_map=args.auto_device_map  # Pass the new argument
-    )
-    
-    # Create interface
-    interface = create_demo_interface(demo_instance)
-    
-    print(f"🚀 Launching demo on port {args.port}")
-    print(f"📁 Model path: {args.model_path}")
-    print(f"🎭 Available voices: {len(demo_instance.available_voices)}")
-    print(f"🔴 Streaming mode: ENABLED")
-    print(f"🔒 Session isolation: ENABLED")
-    
-    # Launch the interface
-    try:
-        interface.queue(
-            max_size=20,  # Maximum queue size
-            default_concurrency_limit=1  # Process one request at a time
-        ).launch(
-            share=True,
-            # server_port=args.port,
-            server_name="0.0.0.0" if args.share else "127.0.0.1",
-            show_error=True,
-            show_api=False  # Hide API docs for cleaner interface
-        )
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down gracefully...")
-    except Exception as e:
-        print(f"❌ Server error: {e}")
-        raise
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="aoi-ot/VibeVoice-Large")
+    parser.add_argument("--inference_steps", type=int, default=15, help="DDPM steps for diffusion (Default: 15)")
+    parser.add_argument("--t4_mode", action="store_true", help="Force 4-bit NF4 for Single T4 GPU compatibility")
+    parser.add_argument("--auto_device_map", action="store_true", help="Use Dual-GPU split (if not using t4_mode)")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    args = parser.parse_args()
+    set_seed(42)
+    demo = RSRTTSDemo(args.model_path, inference_steps=args.inference_steps, auto_device_map=args.auto_device_map, t4_mode=args.t4_mode)
+    iface = create_demo_interface(demo)
+    iface.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
 
 if __name__ == "__main__":
     main()
