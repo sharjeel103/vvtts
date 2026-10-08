@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/VibeVoice/demo/gradio_demo.py
 """
 RSR TTS - High-Quality Dialogue Generation Interface with Streaming Support
 Optimized for NVIDIA T4 (4-bit NF4 Quantization) & Dual GPU Setups
